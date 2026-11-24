@@ -1,0 +1,2077 @@
+/**
+ * frank-386 - i386 PC Emulator for RP2350
+ *
+ * Main entry point for the RP2350 platform.
+ * Initializes hardware, loads configuration, and starts the emulator.
+ *
+ * Copyright (c) 2026 Mikhail Matveev <xtreme@rh1.tech>
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
+#include "hardware/gpio.h"
+#include "hardware/flash.h"
+#include "hardware/watchdog.h"
+
+#include "hardware/structs/qmi.h"
+
+#ifdef LIB_PICO_STDIO_UART
+#include "hardware/uart.h"
+#endif
+
+#include "board_config.h"
+#include "jit16.h"
+#include "psram_init.h"
+#if USB_CDC_CONSOLE
+#include "usb_console.h"
+#endif
+#include "hdmi.h"
+#include "pico/bootrom.h"
+#include "hardware/structs/psm.h"
+#include "vga_hw.h"
+#include "vga.h"
+#include "ps2.h"
+#include "ps2kbd_wrapper.h"
+#ifdef USB_HID_ENABLED
+#include "usbkbd_wrapper.h"
+#include "usbmouse_wrapper.h"
+#include "usbgamepad.h"
+#endif
+#ifdef NESPAD_GPIO_CLK
+#include "nespad.h"
+#endif
+#include "sdcard.h"
+#include "ff.h"
+#include "audio.h"
+
+#include "pc.h"
+#include "hle/boot.h"
+#include "hle/hle.h"
+#include "fdos/dosrt.h"
+#include "ini.h"
+#include "debug.h"
+#include "diskui.h"
+#include "settingsui.h"
+#include "config_save.h"
+#include "vga_osd.h"
+#include "profile_subsys.h"
+#include "remote_mem.h"
+#include "codeprofile.h"
+#include "pcsample.h"
+#include "autotype.h"
+#include "disk.h"
+#include "adlib.h"
+#if SD_SLAVE_CACHE
+#include "sc_master.h"
+#endif
+#include "bbprofile.h"
+#include "diskcache.h"
+#include "gameport.h"
+#include "ems.h"
+
+//=============================================================================
+// Version Information
+//=============================================================================
+
+// Version is defined in CMakeLists.txt from version.txt
+#ifndef FRANK_DOS_VERSION_MAJOR
+#define FRANK_DOS_VERSION_MAJOR 1
+#endif
+#ifndef FRANK_DOS_VERSION_MINOR
+#define FRANK_DOS_VERSION_MINOR 0
+#endif
+
+//=============================================================================
+// Global State
+//=============================================================================
+
+PC *pc = NULL;
+/* the one FIL main.c's boot and console helpers share (none runs inside
+ * another): 600 bytes of SRAM each, eight times over before */
+static FIL util_fil;
+
+int psram_cs_override = -1;  // see get_psram_pin()
+static PCConfig config;
+volatile bool initialized = false;
+
+/* Track the voltage actually programmed into the RP2350 regulator. */
+static uint16_t current_vreg_mv = 1100;
+
+static uint16_t vreg_to_mv(enum vreg_voltage v) {
+    switch ((int)v) {
+    case 15: return 1300;
+    case 16: return 1350;
+    case 17: return 1400;
+    case 18: return 1500;
+    case 19: return 1600;
+    case 20: return 1650;
+    case 21: return 1700;
+    case 22: return 1800;
+    default: return 1100;
+    }
+}
+
+/*
+ * Interpreter throughput, always compiled.
+ *
+ * SUBSYS_PROFILE cannot answer "is this faster?" — it puts two DWT reads
+ * inside the 409-iteration AdLib loop and measurably slows the machine,
+ * so any absolute number from it is worthless. This counter touches the
+ * hot path once per pc_step(), i.e. once per 4096 guest instructions,
+ * which is free.
+ *
+ * g_mips is thousandths of a MIP (1650 == 1.650 MIPS), sampled over the
+ * last window. Read it over SWD; it needs no console.
+ */
+volatile uint32_t g_mips __attribute__((used));
+volatile uint32_t g_mips_clk __attribute__((used));
+/*
+ * Cumulative average since emulation started.
+ *
+ * The windowed figure swings ~10% as the Wolf3D demo's scene complexity
+ * changes, which would drown any single-digit optimisation. The
+ * cumulative average over a deterministic boot path (autotype drives the
+ * same keys, the demo is recorded playback) is repeatable to well under
+ * a percent, so it is the one to A/B against.
+ */
+volatile uint32_t g_mips_avg __attribute__((used));
+static uint32_t tp_steps;
+static uint64_t tp_t0;
+static uint64_t tp_t_start;
+static uint64_t tp_cyc_start, tp_cyc0;
+
+static inline void throughput_tick(void) {
+    /*
+     * Count instructions actually retired, not pc_step() calls.
+     *
+     * A pc_step() on a halted guest returns immediately without running
+     * its 4096-instruction budget, so estimating from step counts made
+     * an idle DOS prompt look like 9 MIPS. cpu->cycle is incremented per
+     * decoded instruction in cpu_exec1, which is exact and immune to
+     * that. Read once per 2000 steps, so it costs nothing.
+     */
+    if (++tp_steps < 2000u) return;
+    tp_steps = 0;
+
+    const uint64_t now = time_us_64();
+    const uint64_t cyc = (uint64_t)(unsigned long)cpui386_get_cycle(pc->cpu);
+
+    if (tp_t_start == 0) { tp_t_start = now; tp_cyc_start = cyc; tp_t0 = now; tp_cyc0 = cyc; return; }
+
+    const uint64_t all_us = now - tp_t_start;
+    if (all_us) g_mips_avg = (uint32_t)(((cyc - tp_cyc_start) * 1000ull) / all_us);
+
+    const uint64_t win_us = now - tp_t0;
+    if (win_us) g_mips = (uint32_t)(((cyc - tp_cyc0) * 1000ull) / win_us);
+    g_mips_clk = clock_get_hz(clk_sys) / 1000000u;
+
+    tp_t0 = now; tp_cyc0 = cyc;
+    cp_report((uint32_t)(win_us / 1000ull));
+    bb_report();
+}
+
+// Framebuffer for VGA output (in PSRAM)
+static uint8_t *framebuffer = NULL;
+
+// FatFS state
+static FATFS fatfs;
+
+// Flag to track if VGA is initialized (for error display)
+static volatile bool vga_initialized = false;
+
+//=============================================================================
+// Error Display
+//=============================================================================
+
+/**
+ * Display a fatal error screen (red box on black background).
+ * Halts execution after displaying the message.
+ * Can only display errors if VGA is initialized.
+ */
+static void show_error_screen(const char *title, const char *message, const char *detail) {
+    if (!vga_initialized) {
+        // VGA not ready, just print to serial and halt
+        printf("FATAL ERROR: %s\n", title);
+        printf("  %s\n", message);
+        if (detail) printf("  %s\n", detail);
+        while (1) { sleep_ms(1000); }
+    }
+
+    // Initialize OSD for error display
+    osd_init();
+    osd_clear();
+
+    // Fill screen with black
+    uint8_t black_attr = OSD_ATTR(OSD_WHITE, OSD_BLACK);
+    osd_fill(0, 0, OSD_COLS, OSD_ROWS, ' ', black_attr);
+
+    // Draw red error box in center
+    int box_w = 60;
+    int box_h = 10;
+    int box_x = (OSD_COLS - box_w) / 2;
+    int box_y = (OSD_ROWS - box_h) / 2;
+
+    uint8_t error_attr = OSD_ATTR(OSD_WHITE, OSD_RED);
+    uint8_t text_attr = OSD_ATTR(OSD_YELLOW, OSD_RED);
+
+    // Fill box background
+    osd_fill(box_x, box_y, box_w, box_h, ' ', error_attr);
+
+    // Draw box border
+    osd_draw_box_titled(box_x, box_y, box_w, box_h, title, error_attr);
+
+    // Print message
+    int msg_y = box_y + 3;
+    osd_print(box_x + 3, msg_y, message, text_attr);
+
+    // Print detail if provided
+    if (detail && detail[0]) {
+        osd_print(box_x + 3, msg_y + 2, detail, error_attr);
+    }
+
+    // Print hint at bottom
+    osd_print(box_x + 3, box_y + box_h - 2, "Please check hardware and restart.", error_attr);
+
+    osd_show();
+
+    // Also print to serial
+    printf("FATAL ERROR: %s\n", title);
+    printf("  %s\n", message);
+    if (detail) printf("  %s\n", detail);
+
+    // Halt
+    while (1) {
+        sleep_ms(1000);
+    }
+}
+
+/**
+ * Display a warning screen (yellow box) but continue execution.
+ */
+static void show_warning_screen(const char *title, const char *message, int delay_ms) {
+    if (!vga_initialized) {
+        printf("WARNING: %s - %s\n", title, message);
+        return;
+    }
+
+    osd_init();
+    osd_clear();
+
+    // Fill screen with black
+    uint8_t black_attr = OSD_ATTR(OSD_WHITE, OSD_BLACK);
+    osd_fill(0, 0, OSD_COLS, OSD_ROWS, ' ', black_attr);
+
+    // Draw yellow warning box
+    int box_w = 60;
+    int box_h = 8;
+    int box_x = (OSD_COLS - box_w) / 2;
+    int box_y = (OSD_ROWS - box_h) / 2;
+
+    uint8_t warn_attr = OSD_ATTR(OSD_BLACK, OSD_YELLOW);
+
+    osd_fill(box_x, box_y, box_w, box_h, ' ', warn_attr);
+    osd_draw_box_titled(box_x, box_y, box_w, box_h, title, warn_attr);
+    osd_print(box_x + 3, box_y + 3, message, warn_attr);
+
+    osd_show();
+
+    printf("WARNING: %s - %s\n", title, message);
+    sleep_ms(delay_ms);
+
+    osd_hide();
+}
+
+//=============================================================================
+// Platform HAL Implementation
+//=============================================================================
+
+/**
+ * Get microsecond timestamp.
+ */
+uint32_t __not_in_flash_func(get_uticks)(void) {
+    return time_us_32();
+}
+
+/**
+ * Allocate memory (uses PSRAM for large allocations).
+ */
+void *pcmalloc(long size) {
+    return malloc(size);
+}
+
+/**
+ * Load ROM file from SD card to memory.
+ */
+int load_rom(void *phys_mem, const char *file, uword addr, int backward) {
+    /*
+     * Static, not on the stack: a FIL carries a 512-byte sector buffer,
+     * and core 0's stack (top of SCRATCH_Y, 4 KB shared with the data
+     * placed there) is only a few hundred bytes deeper than this boot
+     * path. On the stack, main -> init_emulator -> pc_new -> load_rom ->
+     * FatFS/printf ran into spread8_lut and corrupted EGA/VGA 640-wide
+     * output (PR #9). The same goes for the other boot-time file
+     * helpers in this file. Core 0 only, never reentered.
+     */
+    FIL *const fpp = &util_fil;
+    FRESULT res;
+    UINT bytes_read;
+
+    static char path[256];
+    snprintf(path, sizeof(path), "386/%s", file);
+
+    res = f_open(fpp, path, FA_READ);
+    if (res != FR_OK) {
+        printf("Failed to open ROM: %s (error %d)\n", path, res);
+        return -1;
+    }
+
+    FSIZE_t size = f_size(fpp);
+
+    uint8_t *dest;
+    if (backward) {
+        // Load so ROM ends at addr (for BIOS - should end at 1MB boundary)
+        dest = (uint8_t *)phys_mem + addr - size;
+        DBG_PRINT("Loading ROM: %s (%lu bytes) at 0x%08lx-0x%08lx (dest=%p)\n",
+               file, (unsigned long)size,
+               (unsigned long)(addr - size), (unsigned long)(addr - 1), dest);
+    } else {
+        dest = (uint8_t *)phys_mem + addr;
+        DBG_PRINT("Loading ROM: %s (%lu bytes) at 0x%08lx (dest=%p)\n",
+               file, (unsigned long)size, (unsigned long)addr, dest);
+    }
+
+    res = f_read(fpp, dest, size, &bytes_read);
+    if (res != FR_OK || bytes_read != size) {
+        f_close(fpp);
+        printf("ERROR: Failed to read ROM: %s (error %d, read %u of %lu)\n",
+               file, res, bytes_read, (unsigned long)size);
+        return -1;
+    }
+
+    f_close(fpp);
+
+    // Debug: verify data was written to memory
+    DBG_PRINT("  First bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+           dest[0], dest[1], dest[2], dest[3],
+           dest[4], dest[5], dest[6], dest[7]);
+    DBG_PRINT("  Last bytes:  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+           dest[size-8], dest[size-7], dest[size-6], dest[size-5],
+           dest[size-4], dest[size-3], dest[size-2], dest[size-1]);
+
+    return (int)size;  // Return size on success
+}
+
+//=============================================================================
+// VGA Redraw Callback - Bridge emulator VGA state to hardware driver
+//=============================================================================
+
+static void vga_redraw(void *opaque, int x, int y, int w, int h) {
+    (void)opaque;
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    // No action needed - VGA updates are handled in the main loop
+}
+
+//=============================================================================
+// Keyboard Polling
+//=============================================================================
+
+// Track modifier key state for Win+F12 hotkey
+static bool win_key_pressed = false;
+
+// Process a single keycode, handling disk UI and settings UI hotkeys
+// Returns true if key should be passed to emulator, false if consumed
+static bool process_keycode(int is_down, int keycode) {
+    // Track Win key state
+    if (keycode == KEY_LEFTMETA) {
+        win_key_pressed = is_down;
+    }
+
+    // Check for Win+F12 hotkey to toggle disk UI
+    if (is_down && keycode == KEY_F12 && win_key_pressed) {
+        if (!diskui_is_open() && !settingsui_is_open()) {
+            // Open disk UI and pause emulation
+            diskui_open();
+            if (pc) {
+                pc->paused = 1;
+                audio_set_enabled(false);
+            }
+        } else if (diskui_is_open()) {
+            // Close disk UI and resume emulation
+            diskui_close();
+            if (pc) {
+                pc->paused = 0;
+                audio_set_enabled(true);
+            }
+        }
+        return false;  // Don't pass to emulator
+    }
+
+    // Check for Win+F11 hotkey to toggle settings UI
+    if (is_down && keycode == KEY_F11 && win_key_pressed) {
+        if (!settingsui_is_open() && !diskui_is_open()) {
+            // Open settings UI and pause emulation
+            settingsui_open();
+            if (pc) {
+                pc->paused = 1;
+                audio_set_enabled(false);
+            }
+        } else if (settingsui_is_open()) {
+            // Close settings UI and resume emulation
+            settingsui_close();
+            if (pc) {
+                pc->paused = 0;
+                audio_set_enabled(true);
+            }
+        }
+        return false;  // Don't pass to emulator
+    }
+
+    // When disk UI is open, route all keys to it
+    if (diskui_is_open()) {
+        diskui_handle_key(keycode, is_down);
+
+        // Check if disk UI was closed by Escape
+        if (!diskui_is_open() && pc && pc->paused) {
+            pc->paused = 0;
+            audio_set_enabled(true);
+        }
+        return false;  // Don't pass to emulator
+    }
+
+    // When settings UI is open, route all keys to it
+    if (settingsui_is_open()) {
+        settingsui_handle_key(keycode, is_down);
+
+        // Check if settings UI was closed by Escape
+        if (!settingsui_is_open() && pc && pc->paused) {
+            pc->paused = 0;
+            audio_set_enabled(true);
+        }
+        return false;  // Don't pass to emulator
+    }
+
+    return true;  // Pass to emulator
+}
+
+typedef struct {
+    int32_t rem_x, rem_y;
+    int setting;
+} MouseScaleState;
+
+static void mouse_scale_delta(MouseScaleState *st, int16_t *dx, int16_t *dy)
+{
+    static const uint8_t num[9] = { 1, 1, 1, 2, 1, 3, 2, 3, 4 };
+    static const uint8_t den[9] = { 4, 3, 2, 3, 1, 2, 1, 1, 1 };
+    int setting = config_get_mouse_sensitivity();
+
+    if (setting < 0 || setting > 8)
+        setting = 4;
+    if (st->setting != setting) {
+        st->setting = setting;
+        st->rem_x = st->rem_y = 0;
+    }
+
+    if (setting == 4)
+        return;
+
+    int32_t ax = st->rem_x + (int32_t)*dx * num[setting];
+    int32_t ay = st->rem_y + (int32_t)*dy * num[setting];
+    int32_t ox = ax / den[setting];
+    int32_t oy = ay / den[setting];
+    st->rem_x = ax - ox * den[setting];
+    st->rem_y = ay - oy * den[setting];
+    *dx = (int16_t)ox;
+    *dy = (int16_t)oy;
+}
+
+static void poll_keyboard(void) {
+    int is_down, keycode;
+
+#ifdef BOARD_HAS_PS2
+    // Poll PS/2 keyboard
+    ps2kbd_tick();
+
+    while (ps2kbd_get_key(&is_down, &keycode)) {
+        if (process_keycode(is_down, keycode)) {
+            if (pc && pc->kbd) {
+                ps2_put_keycode(pc->kbd, is_down, keycode);
+            }
+        }
+    }
+
+    // Poll PS/2 mouse (only if PS/2/USB mouse enabled, not NES mouse)
+    if (pc && config_get_mouse() && !pc->paused) {
+        int16_t dx, dy;
+        int8_t dz;
+        uint8_t buttons;
+        if (ps2_mouse_get_state(&dx, &dy, &dz, &buttons)) {
+            if (pc->mouse) {
+                static MouseScaleState mouse_scale = { .setting = -1 };
+                int16_t my = config_get_mouse_invert_y() ? -dy : dy;
+                mouse_scale_delta(&mouse_scale, &dx, &my);
+                ps2_mouse_event(pc->mouse, dx, my, dz, buttons);
+            }
+        }
+    }
+#endif // BOARD_HAS_PS2
+
+#ifdef USB_HID_ENABLED
+    // Poll USB keyboard
+    usbkbd_tick();
+
+    while (usbkbd_get_key(&is_down, &keycode)) {
+        if (process_keycode(is_down, keycode)) {
+            if (pc && pc->kbd) {
+                ps2_put_keycode(pc->kbd, is_down, keycode);
+            }
+        }
+    }
+
+    // Poll USB mouse (only if PS/2/USB mouse enabled, not NES mouse)
+    if (pc && config_get_mouse() && !pc->paused) {
+        int16_t dx, dy;
+        int8_t dz;
+        uint8_t buttons;
+        if (usbmouse_get_event(&dx, &dy, &dz, &buttons)) {
+            if (pc->mouse) {
+                static MouseScaleState mouse_scale = { .setting = -1 };
+                mouse_scale_delta(&mouse_scale, &dx, &dy);
+                ps2_mouse_event(pc->mouse, dx, dy, dz, buttons);
+            }
+        }
+    }
+#endif
+
+    /*
+     * NES gamepad -> DOS analog joystick (game port at 0x201).
+     *
+     * The pad is read every poll rather than only when it moves: the game
+     * port is level-sensing, not event-driven, so the emulated stick has
+     * to hold its position for as long as the button is held.
+     */
+#ifdef NESPAD_GPIO_CLK
+    if (pc && !pc->paused && config_get_nes_joystick()) {
+        nespad_read();
+        const uint32_t pad = nespad_state;
+        int jx = 0, jy = 0;
+        if (pad & DPAD_LEFT)  jx = -1;
+        if (pad & DPAD_RIGHT) jx =  1;
+        if (pad & DPAD_UP)    jy = -1;
+        if (pad & DPAD_DOWN)  jy =  1;
+        /* A and B are the two buttons every DOS game expects; SNES pads
+         * also offer X/Y, mapped alongside so either pair works. */
+        uint8_t jb = 0;
+        if (pad & (DPAD_A | DPAD_Y)) jb |= 0x01;
+        if (pad & (DPAD_B | DPAD_X)) jb |= 0x02;
+        gameport_set(jx, jy, jb);
+    }
+#endif
+
+#ifdef USB_HID_ENABLED
+    /* USB gamepad -> the same emulated game port. Checked after the NES
+     * pad so that on boards with both, whichever is actually moving
+     * wins the last word each poll. */
+    if (pc && !pc->paused && config_get_usb_joystick() && usbgamepad_connected()) {
+        int jx = 0, jy = 0;
+        uint8_t jb = 0;
+        usbgamepad_get(&jx, &jy, &jb);
+        gameport_set(jx, jy, jb);
+    }
+#endif
+
+    // NES gamepad -> mouse emulation (if enabled and gamepad pins defined)
+#ifdef NESPAD_GPIO_CLK
+    if (pc && pc->mouse && !pc->paused && config_get_nes_mouse()) {
+        static uint8_t prev_buttons = 0;
+        static uint64_t next_move_us = 0;
+        nespad_read();
+        uint32_t pad = nespad_state;
+        int16_t dx = 0, dy = 0;
+        uint8_t buttons = 0;
+
+        /*
+         * A pad is level-sensing, unlike a real mouse which supplies motion
+         * deltas at its own report rate.  Never turn one held D-pad direction
+         * into one mickey per emulator poll: platform_poll() frequency follows
+         * emulation speed and can be thousands of calls per second.
+         *
+         * 60 mickeys/s at 1x keeps NES-mouse motion independent of the
+         * emulator poll rate. The common host sensitivity scaler is applied
+         * afterwards, so 1/4x..4x works for the pad as well.
+         */
+        const uint32_t move_mask = DPAD_LEFT | DPAD_RIGHT | DPAD_UP | DPAD_DOWN;
+        if (pad & move_mask) {
+            uint64_t now = time_us_64();
+            if (!next_move_us || now >= next_move_us) {
+                if (pad & DPAD_LEFT)  dx = -1;
+                if (pad & DPAD_RIGHT) dx =  1;
+                if (pad & DPAD_UP)    dy = -1;
+                if (pad & DPAD_DOWN)  dy =  1;
+                next_move_us = now + 16667u; /* ~60 Hz */
+            }
+        } else {
+            next_move_us = 0;
+        }
+
+        // B = left button, A = right button
+        if (pad & DPAD_B) buttons |= 0x01;  // left
+        if (pad & DPAD_A) buttons |= 0x02;  // right
+
+        // Button transitions stay immediate even between movement ticks.
+        if (dx || dy || buttons != prev_buttons) {
+            static MouseScaleState mouse_scale = { .setting = -1 };
+            mouse_scale_delta(&mouse_scale, &dx, &dy);
+            ps2_mouse_event(pc->mouse, dx, dy, 0, buttons);
+        }
+        prev_buttons = buttons;
+    }
+#endif
+}
+
+//=============================================================================
+// Platform Poll Callback
+//=============================================================================
+
+static void platform_poll(void *opaque) {
+    (void)opaque;
+    poll_keyboard();
+    // VGA update is handled by Core 1, don't call here to avoid contention
+}
+
+//=============================================================================
+// Configuration Loading
+//=============================================================================
+
+static void load_default_config(void) {
+    memset(&config, 0, sizeof(config));
+
+    // Guest RAM follows physically detected QSPI PSRAM.
+    size_t detected_psram = psram_detected_size();
+#if EMULATE_LTEMS
+    if (detected_psram >= (2u << 20)) {
+        config.mem_size = detected_psram - (2u << 20);
+        ems_backing_linear_base = (uint32_t)config.mem_size;
+    } else {
+        config.mem_size = detected_psram;
+        ems_backing_linear_base = 0;
+    }
+#else
+    config.mem_size = detected_psram;
+#endif
+    config.vga_mem_size = EMU_VGA_MEM_SIZE_KB * 1024;
+
+    // CPU configuration
+    config.cpu_gen = EMU_CPU_GEN;
+    config.fpu = 0;  // Disabled for initial port
+
+    // Display configuration
+    config.width = 640;
+    config.height = 400;
+
+    // BIOS files (relative to 386 directory on SD card)
+    config.bios = "bios.bin";
+    config.vga_bios = "vgabios.bin";
+
+    // No disks by default (set via INI file)
+    for (int i = 0; i < 4; i++) {
+        config.ata[i] = NULL;
+        config.iscd[i] = 0;
+    }
+    config.fdd[0] = NULL;
+    config.fdd[1] = NULL;
+
+    config.redirector = 1;
+    config.enable_serial = 0;
+    config.vga_force_8dm = 0;
+}
+
+/* FRANK DOS's own settings over whatever config.ini was read (a card set up
+ * for frank-386 keeps its config.ini): CONFIG_PLATFORM_DIR/frankdos.ini,
+ * the [frank-386] keys (jit=, cpu_freq=, psram_freq=, ...) */
+static void frankdos_overrides(void) {
+    FIL *const fpp = &util_fil;
+    if (f_open(fpp, CONFIG_PLATFORM_DIR "/frankdos.ini", FA_READ) != FR_OK)
+        return;
+    FSIZE_t size = f_size(fpp);
+    char *content = malloc(size + 1);
+    UINT n = 0;
+    if (content && f_read(fpp, content, size, &n) == FR_OK) {
+        content[n] = '\0';
+        ini_parse_string(content, parse_frank_386_ini, NULL);
+        DBG_PRINT("  Loaded " CONFIG_PLATFORM_DIR "/frankdos.ini\n");
+    }
+    free(content);
+    f_close(fpp);
+}
+
+/* where the config's disk images are (the directory its names are relative to) */
+static const char *image_dir = CONFIG_LEGACY_DIR;
+
+static int load_config_from_sd(const char *filename) {
+    // Static to keep the boot path's stack shallow, see load_rom()
+    FIL *const fpp = &util_fil;
+    FRESULT res;
+    static DIR dir;
+    static FILINFO fno;
+
+    // Debug: List 386 directory contents
+    DBG_PRINT("Checking SD card contents...\n");
+    res = f_opendir(&dir, "386");
+    if (res == FR_OK) {
+        DBG_PRINT("  386/ directory found, contents:\n");
+        while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
+            DBG_PRINT("    %s%s (%lu bytes)\n",
+                   fno.fname,
+                   (fno.fattrib & AM_DIR) ? "/" : "",
+                   (unsigned long)fno.fsize);
+        }
+        f_closedir(&dir);
+    } else {
+        DBG_PRINT("  386/ directory not found (error %d)\n", res);
+        // Try root directory
+        res = f_opendir(&dir, "");
+        if (res == FR_OK) {
+            DBG_PRINT("  Root directory contents:\n");
+            while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
+                DBG_PRINT("    %s%s\n", fno.fname, (fno.fattrib & AM_DIR) ? "/" : "");
+            }
+            f_closedir(&dir);
+        }
+    }
+
+    static char path[256];
+    snprintf(path, sizeof(path), CONFIG_PLATFORM_DIR "/%s", filename);
+
+    res = f_open(fpp, path, FA_READ);
+    if (res != FR_OK) {
+        DBG_PRINT("Config file not found: %s (error %d)\n", path, res);
+        snprintf(path, sizeof(path), CONFIG_LEGACY_DIR "/%s", filename);
+        res = f_open(fpp, path, FA_READ);
+    }
+    if (res != FR_OK) {
+        /* a card set up for frank-386: its config and images, read-only */
+        DBG_PRINT("Config file not found: %s (error %d)\n", path, res);
+        snprintf(path, sizeof(path), "386/%s", filename);
+        res = f_open(fpp, path, FA_READ);
+        if (res == FR_OK)
+            image_dir = "386";
+    }
+    if (res != FR_OK) {
+        DBG_PRINT("Config file not found: %s (error %d)\n", path, res);
+        return -1;
+    }
+
+    DBG_PRINT("Loading config: %s\n", path);
+
+    // Read entire file
+    FSIZE_t size = f_size(fpp);
+    char *content = malloc(size + 1);
+    if (!content) {
+        f_close(fpp);
+        return -1;
+    }
+
+    UINT bytes_read;
+    res = f_read(fpp, content, size, &bytes_read);
+    f_close(fpp);
+
+    if (res != FR_OK) {
+        free(content);
+        return -1;
+    }
+
+    content[size] = '\0';
+
+    // Parse INI content
+    if (ini_parse_string(content, parse_conf_ini, &config) != 0) {
+        printf("Failed to parse config\n");
+        free(content);
+        return -1;
+    }
+
+    // Also parse frank-386-specific settings
+    ini_parse_string(content, parse_frank_386_ini, NULL);
+
+    free(content);
+    frankdos_overrides();
+    return 0;
+}
+
+//=============================================================================
+// Clock Configuration
+//=============================================================================
+
+/*
+ * Re-derive the console UART's baud divisors from the current clock.
+ *
+ * uart_init() computes them once, from whatever clk_peri happened to be
+ * at the time — 150 MHz, straight out of the SDK's runtime init. Every
+ * later set_sys_clock_khz() drags clk_peri with it and leaves those
+ * divisors stale, so the console turns to line noise at exactly the
+ * moment the firmware starts overclocking. On C2 the UART is the only
+ * debug surface there is, and losing it one line into the boot makes the
+ * board very hard to bring up.
+ *
+ * uart_set_baudrate() recomputes against the live clock, so calling it
+ * after each clock change is all it takes. Cheap enough to be
+ * unconditional.
+ */
+void console_reclock(void) {
+#ifdef LIB_PICO_STDIO_UART
+    uart_set_baudrate(uart_default, PICO_DEFAULT_UART_BAUD_RATE);
+#endif
+}
+
+/*
+ * Make sure the flash chip has its Quad Enable bit set.
+ *
+ * Winbond parts ship with QE=1. Some boards — Waveshare RP2350-PiZero
+ * batches with Puya flash among them — ship with QE=0, which leaves the
+ * flash's IO2/IO3 as WP#/HOLD# rather than data lines. With PSRAM on the
+ * same QSPI bus such a board locks up or fails the PSRAM test as soon as
+ * it is overclocked (issue #6). The standalone FLASH_QE_SET_1.uf2
+ * fixes it once; doing the same here means nobody has to know about it.
+ *
+ * QE is non-volatile, so this writes the status register at most once
+ * in the chip's life: every later boot reads QE=1 and returns. Only
+ * vendors whose QE is bit 1 of SR2, read with 0x35 and written with
+ * 0x31, are touched — on e.g. Macronix 0x35 means "enter QPI" instead.
+ *
+ * The flash is unreadable while it rewrites a status register, so the
+ * whole sequence — including the busy poll — runs from RAM with
+ * interrupts off. Must run before core 1 is launched.
+ *
+ * Returns -1 if the vendor is not handled, 0 if QE was already set,
+ * 1 if it was set now, and -2 if the write did not take.
+ */
+static int __no_inline_not_in_flash_func(flash_ensure_qe)(uint8_t *jedec_mfr) {
+    uint8_t tx[4], rx[4];
+
+    tx[0] = 0x9F; tx[1] = 0; tx[2] = 0; tx[3] = 0;
+    flash_do_cmd(tx, rx, 4);
+    *jedec_mfr = rx[1];
+    switch (rx[1]) {
+    case 0xEF:  // Winbond
+    case 0xC8:  // GigaDevice
+    case 0x85:  // Puya
+    case 0x68:  // Boya
+    case 0x5E:  // Zbit
+        break;
+    case 0x20:  // XMC, but Micron uses 20h too and has no SR2 QE bit
+        if (rx[2] != 0x40 && rx[2] != 0x70) return -1;  // XM25QH memory types
+        break;
+    default:
+        return -1;
+    }
+
+    tx[0] = 0x35; tx[1] = 0;
+    flash_do_cmd(tx, rx, 2);
+    const uint8_t sr2 = rx[1];
+    if (sr2 & 0x02) return 0;
+
+    tx[0] = 0x06;                       // Write Enable
+    flash_do_cmd(tx, rx, 1);
+    tx[0] = 0x31; tx[1] = sr2 | 0x02;   // Write SR2, keep the other bits
+    flash_do_cmd(tx, rx, 2);
+
+    // Poll WIP. tW is 15 ms worst case; each poll is tens of us.
+    for (int i = 0; i < 100000; i++) {
+        tx[0] = 0x05; tx[1] = 0;
+        flash_do_cmd(tx, rx, 2);
+        if (!(rx[1] & 0x01)) break;
+    }
+
+    tx[0] = 0x35; tx[1] = 0;
+    flash_do_cmd(tx, rx, 2);
+    return (rx[1] & 0x02) ? 1 : -2;
+}
+
+static void flash_qe_fixup(void) {
+    uint8_t mfr;
+    uint32_t irq = save_and_disable_interrupts();
+    int r = flash_ensure_qe(&mfr);
+    restore_interrupts(irq);
+
+    if (r == 1)
+        printf("Flash (JEDEC %02X): Quad Enable bit was off, now set\n", mfr);
+    else if (r == -2)
+        printf("WARNING: flash (JEDEC %02X) did not accept the Quad Enable bit\n", mfr);
+    else
+        DBG_PRINT("Flash JEDEC %02X: QE %s\n", mfr, r == 0 ? "set" : "not checked");
+}
+
+// Flash timing configuration for overclocking
+void __no_inline_not_in_flash_func(set_flash_timings)(int cpu_mhz, int cfg_flash) {
+    const int clock_hz = cpu_mhz * 1000000;
+    const int max_flash_freq = cfg_flash * 1000000;
+
+    int divisor = (clock_hz + max_flash_freq - (max_flash_freq >> 4) - 1) / max_flash_freq;
+    if (divisor == 1 && clock_hz >= 166000000) {
+        divisor = 2;
+    }
+
+    int rxdelay = divisor;
+    if (clock_hz / divisor > 100000000 && clock_hz >= 166000000) {
+        rxdelay += 1;
+    }
+
+    qmi_hw->m[0].timing = 0x60007000 |
+                        rxdelay << QMI_M0_TIMING_RXDELAY_LSB |
+                        divisor << QMI_M0_TIMING_CLKDIV_LSB;
+}
+
+static void configure_clocks(void) {
+#if CPU_CLOCK_MHZ > 252
+    // Overclock: disable voltage limit and set higher voltage
+    DBG_PRINT("Configuring overclock: %d MHz @ %s\n", CPU_CLOCK_MHZ,
+           CPU_CLOCK_MHZ >= 504 ? "1.65V" :
+           CPU_CLOCK_MHZ >= 378 ? "1.60V" : "1.50V");
+
+    vreg_disable_voltage_limit();
+    vreg_set_voltage(CPU_VOLTAGE);
+    current_vreg_mv = vreg_to_mv(CPU_VOLTAGE);
+    sleep_ms(100);  // Stabilization delay
+
+    // Configure flash timing BEFORE changing clock
+    set_flash_timings(CPU_CLOCK_MHZ, FLASH_MAX_FREQ_MHZ);
+#endif
+
+    // Set system clock
+    set_sys_clock_khz(CPU_CLOCK_MHZ * 1000, false);
+    console_reclock();
+
+    DBG_PRINT("System clock: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
+}
+
+/**
+ * Get voltage for CPU frequency
+ */
+static enum vreg_voltage get_voltage_for_freq(int mhz) {
+    int v = config_get_voltage();
+    if (v >= 0) return (enum vreg_voltage)v;  /* user override */
+    /* auto: safe defaults per frequency */
+    if (mhz > 504) return VREG_VOLTAGE_1_65;
+    if (mhz >= 378) return VREG_VOLTAGE_1_60;
+    return VREG_VOLTAGE_1_50;
+}
+
+/**
+ * Reconfigure clocks at runtime based on INI settings.
+ * This function MUST run from RAM, not flash.
+ */
+static void __no_inline_not_in_flash_func(reconfigure_clocks)(int cpu_mhz, int psram_mhz, uint psram_pin, int cfg_flash) {
+    int current_mhz = clock_get_hz(clk_sys) / 1000000;
+
+    DBG_PRINT("Reconfiguring clocks: %d MHz -> %d MHz, PSRAM: %d MHz, FLASH: %d\n",
+              current_mhz, cpu_mhz, psram_mhz, cfg_flash);
+
+    enum vreg_voltage new_voltage = get_voltage_for_freq(cpu_mhz);
+    uint16_t new_vreg_mv = vreg_to_mv(new_voltage);
+
+    // Only change system clock if CPU frequency actually differs.
+    // Unnecessary PLL reconfiguration disrupts PIO timing (HDMI, audio).
+    if (cpu_mhz != current_mhz) {
+        bool lowering = (cpu_mhz < current_mhz);
+
+        if (lowering) {
+            // LOWERING: clock first, then voltage (safe order)
+            set_flash_timings(cpu_mhz, cfg_flash);
+            set_sys_clock_khz(cpu_mhz * 1000, false);
+            sleep_ms(10);
+            vreg_set_voltage(new_voltage);
+            current_vreg_mv = new_vreg_mv;
+        } else {
+            // RAISING: voltage first, then clock (safe order)
+            vreg_disable_voltage_limit();
+            vreg_set_voltage(new_voltage);
+            current_vreg_mv = new_vreg_mv;
+            sleep_ms(50);  // Stabilization delay
+            set_flash_timings(cpu_mhz, cfg_flash);
+            set_sys_clock_khz(cpu_mhz * 1000, false);
+        }
+        console_reclock();
+    } else if (current_vreg_mv != new_vreg_mv) {
+        // HDMI may already have pinned clk_sys at 504 MHz. Voltage still has
+        // to follow config.ini without needlessly reprogramming the PLLs.
+        vreg_disable_voltage_limit();
+        vreg_set_voltage(new_voltage);
+        current_vreg_mv = new_vreg_mv;
+        sleep_ms(50);
+    }
+
+    // Re-initialize PSRAM with the new frequency
+    psram_init_with_freq(psram_pin, psram_mhz);
+
+    // Recalculate VGA PIO clock divider (vga_hw_init ran before this call)
+    vga_hw_reclock();
+
+    DBG_PRINT("Clock reconfiguration complete: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
+}
+
+//=============================================================================
+// Hardware Initialization
+//=============================================================================
+static void core1_entry(void);
+static bool init_hardware(void) {
+    // Before the overclock and before PSRAM: on flash shipped with QE=0
+    // both fail (see flash_ensure_qe)
+    flash_qe_fixup();
+
+    // Configure clocks (including overclock if enabled)
+    configure_clocks();
+
+    // Initialize PSRAM first
+    DBG_PRINT("Initializing PSRAM...\n");
+    uint psram_pin = get_psram_pin();
+    DBG_PRINT("  PSRAM CS pin: GPIO%d\n", psram_pin);
+    psram_init(psram_pin);
+    uint8_t psram_mfid, psram_kgd;
+    psram_get_id(&psram_mfid, &psram_kgd);
+    DBG_PRINT("  PSRAM ID: MF %02X KGD %02X%s\n", psram_mfid, psram_kgd,
+              psram_kgd == 0x5D ? "" : " (expected 5D: no PSRAM on this CS?)");
+
+    /*
+     * Some boards' PSRAM does not hold the configured clock with the
+     * default sampling delay (#6). Rather than stop dead, step down until
+     * the part answers, and keep that as a cap for every later re-init.
+     */
+    size_t detected_psram = psram_detect_size();
+    static const int psram_fallback_mhz[] = { 84, 66, 33 };
+    for (unsigned i = 0; detected_psram < (1u << 20) && i < count_of(psram_fallback_mhz); i++) {
+        if (psram_fallback_mhz[i] >= PSRAM_MAX_FREQ_MHZ) continue;
+        printf("PSRAM not detected (read back %08lX), retrying at %d MHz\n",
+               (unsigned long)psram_probe_readback(), psram_fallback_mhz[i]);
+        psram_init_with_freq(psram_pin, psram_fallback_mhz[i]);
+        detected_psram = psram_detect_size();
+        if (detected_psram >= (1u << 20)) {
+            psram_set_freq_cap(psram_fallback_mhz[i]);
+            printf("WARNING: PSRAM only works at %d MHz or below on this board\n",
+                   psram_fallback_mhz[i]);
+        }
+    }
+#ifdef BOARD_PC
+    /*
+     * The PC layout covers two boards: a Pico 2 in the PICO-PC carrier and
+     * the Olimex RP2350pc (RP2350B). Should the PSRAM not be on the pin
+     * chosen above, try the other candidate before giving up (#10).
+     */
+    if (detected_psram < (1u << 20)) {
+        uint alt = (psram_pin == 8) ? 47 : 8;
+        printf("PSRAM not found on GPIO%u, trying GPIO%u\n", psram_pin, alt);
+        gpio_set_function(psram_pin, GPIO_FUNC_NULL);
+        psram_set_freq_cap(0);
+        psram_init(alt);
+        psram_get_id(&psram_mfid, &psram_kgd);
+        DBG_PRINT("  PSRAM ID on GPIO%u: MF %02X KGD %02X\n", alt, psram_mfid, psram_kgd);
+        detected_psram = psram_detect_size();
+        if (detected_psram >= (1u << 20)) {
+            psram_pin = alt;
+            psram_cs_override = (int)alt;
+            printf("PSRAM found on GPIO%u\n", alt);
+        }
+    }
+#endif
+    if (detected_psram < (1u << 20)) {
+        printf("ERROR: QSPI PSRAM not detected or smaller than 1 MiB! "
+               "(ID %02X/%02X, read back %08lX)\n",
+               psram_mfid, psram_kgd, (unsigned long)psram_probe_readback());
+        // Can't show visual error - VGA not ready yet
+        return false;
+    }
+    DBG_PRINT("  QSPI PSRAM detected: %lu MiB\n",
+              (unsigned long)(detected_psram >> 20));
+
+    // Mount SD before video/audio so persistent output overrides can be read
+    // before either backend claims its pins.
+    DBG_PRINT("Initializing SD card...\n");
+#ifdef SDIO_PIN_CMD
+    DBG_PRINT("  SDIO 4-bit: CMD GPIO%d, CLK GPIO%d, DAT0-3 GPIO%d-%d\n",
+              SDIO_PIN_CMD, SDIO_PIN_CLK, SDIO_PIN_D0, SDIO_PIN_D0 + 3);
+#else
+    DBG_PRINT("  SCK GPIO%d, MOSI GPIO%d, MISO GPIO%d, CS GPIO%d%s\n",
+              SDCARD_PIN_SPI0_SCK, SDCARD_PIN_SPI0_MOSI, SDCARD_PIN_SPI0_MISO,
+              SDCARD_PIN_SPI0_CS, board_is_rp2350pc() ? " (Olimex RP2350pc)" : "");
+#endif
+    FRESULT res = f_mount(&fatfs, "", 1);
+#ifdef SDIO_PIN_CMD
+    /* frank-react's platform_mount_sd: a card can miss its first SDIO
+     * bring-up after a reset; it answers within a few retries. */
+    for (int attempt = 0; attempt < 6 && res != FR_OK; attempt++) {
+        sleep_ms(50 << attempt);
+        res = f_mount(&fatfs, "", 1);
+    }
+#endif
+    if (res == FR_OK) {
+        FIL *const fpp = &util_fil;
+        if (f_open(fpp, VIDEO_MARKER_VGA, FA_READ) == FR_OK) {
+            vga_hw_set_boot_output(true);
+            f_close(fpp);
+        } else if (f_open(fpp, VIDEO_MARKER_HDMI, FA_READ) == FR_OK) {
+            vga_hw_set_boot_output(false);
+            f_close(fpp);
+        }
+#if HAS_AUDIO_I2S && HAS_AUDIO_PWM
+        if (f_open(fpp, AUDIO_MARKER_I2S, FA_READ) == FR_OK) {
+            audio_set_boot_output(AUDIO_OUTPUT_I2S);
+            f_close(fpp);
+        } else if (f_open(fpp, AUDIO_MARKER_PWM, FA_READ) == FR_OK) {
+            audio_set_boot_output(AUDIO_OUTPUT_PWM);
+            f_close(fpp);
+        }
+#endif
+    }
+
+    // The video driver's 8 KB block off the top of the heap (aligned there by
+    // itself, see hdmi.c), then the heap grown to its new end in one go.
+    // Here, while core 0 is the only one allocating.
+    {
+        extern void *video_ram_block, *heap_reserve_top(size_t size);
+        extern void heap_grow_all(void);
+        video_ram_block = heap_reserve_top(8192);
+        heap_grow_all();
+    }
+
+    // Initialize video/audio early so SD errors can be shown on screen.
+    multicore_launch_core1(core1_entry);
+
+    while(!vga_initialized) {
+        sleep_ms(1);
+        __dmb();
+    }
+    __dmb();
+
+    if (res != FR_OK) {
+        char detail[32];
+        snprintf(detail, sizeof(detail), "FatFS error code: %d", res);
+        show_error_screen(" SD Card Error ", "Failed to mount SD card.", detail);
+        // show_error_screen never returns
+    }
+    DBG_PRINT("  SD card mounted\n");
+
+
+    // Load frank-386-specific hardware settings from the per-platform INI
+    // This allows cpu_freq and psram_freq to be configured
+    {
+        FIL *const fpp = &util_fil;
+        char *content = NULL;
+
+        if (f_open(fpp, CONFIG_FILE_PATH, FA_READ) == FR_OK ||
+            f_open(fpp, CONFIG_LEGACY_PATH, FA_READ) == FR_OK ||
+            f_open(fpp, "386/config.ini", FA_READ) == FR_OK) {
+            FSIZE_t size = f_size(fpp);
+            content = malloc(size + 1);
+            if (content) {
+                UINT bytes_read;
+                if (f_read(fpp, content, size, &bytes_read) == FR_OK) {
+                    content[bytes_read] = '\0';
+                    // Parse just the [frank-386] section
+                    ini_parse_string(content, parse_frank_386_ini, NULL);
+                }
+                free(content);
+            }
+            f_close(fpp);
+            DBG_PRINT("  Loaded config.ini\n");
+        } else {
+            show_warning_screen(" Warning ", "Platform config.ini not found, using defaults.", 2000);
+        }
+        frankdos_overrides();
+
+        // Check if clock reconfiguration is needed
+        int cfg_cpu = config_get_cpu_freq();
+        int cfg_psram = config_get_psram_freq();
+        int cfg_flash = config_get_flash_freq();
+        // If HDMI boosted the clock (to 504 MHz for jitter-free TMDS),
+        // keep it — only reconfigure PSRAM frequency.
+        extern bool SELECT_VGA;
+        int cur_mhz = clock_get_hz(clk_sys) / 1000000;
+        if (!SELECT_VGA && cur_mhz > cfg_cpu) {
+            cfg_cpu = cur_mhz;  // preserve HDMI-boosted clock
+        }
+#ifdef PIN_CLOCKS
+        /* Ignore the SD card's cpu_freq/psram_freq so a clock-scaling
+         * A/B actually varies the clock. config.ini raises this board to
+         * 504 MHz, which would silently flatten every arm of the test. */
+        (void)cfg_cpu; (void)cfg_flash;
+        reconfigure_clocks(CPU_CLOCK_MHZ, PSRAM_MAX_FREQ_MHZ, psram_pin, FLASH_MAX_FREQ_MHZ);
+        DBG_PRINT("  Clocks pinned to build settings: CPU %d, PSRAM %d\n",
+                  CPU_CLOCK_MHZ, PSRAM_MAX_FREQ_MHZ);
+#else
+        if (cfg_cpu != CPU_CLOCK_MHZ || cfg_psram != PSRAM_MAX_FREQ_MHZ ||
+            cfg_flash != FLASH_MAX_FREQ_MHZ ||
+            current_vreg_mv != vreg_to_mv(get_voltage_for_freq(cfg_cpu))) {
+            reconfigure_clocks(cfg_cpu, cfg_psram, psram_pin, cfg_flash);
+        }
+#endif
+    }
+
+#ifdef SDIO_PIN_CMD
+    /* clk_sys is final: the SDIO clock was divided from the boot one (at
+     * 378 -> 504 MHz a 75.6 MHz card clock became 100.8), and the slave's
+     * link times itself from clk_sys on both chips */
+    {
+        extern void sd_clock_changed(void);
+        sd_clock_changed();
+    }
+#endif
+#if SD_SLAVE_CACHE
+    sc_start();
+#endif
+
+    /* The configured PSRAM clock is now final. Re-detect at that frequency so
+     * the capacity used by the emulator is validated under the actual runtime
+     * timing rather than only at the build-time default. */
+    detected_psram = psram_detect_size();
+    if (detected_psram < (1u << 20)) {
+        printf("ERROR: QSPI PSRAM failed detection at configured frequency!\n");
+        return false;
+    }
+    int psram_mhz_eff = config_get_psram_freq();
+    if (psram_get_freq_cap() > 0 && psram_mhz_eff > psram_get_freq_cap())
+        psram_mhz_eff = psram_get_freq_cap();
+    DBG_PRINT("  QSPI PSRAM usable: %lu MiB at %d MHz\n",
+              (unsigned long)(detected_psram >> 20), psram_mhz_eff);
+
+#ifdef BOARD_HAS_PS2
+    // Initialize unified PS/2 driver (keyboard + mouse on shared PIO)
+    DBG_PRINT("Initializing PS/2 (unified driver)...\n");
+    if (board_is_rp2350pc()) {
+        DBG_PRINT("Olimex RP2350pc: no PS/2 port, skipping PS/2\n");
+    } else {
+        DBG_PRINT("  Keyboard CLK: GPIO%d, DATA: GPIO%d\n", PS2_PIN_CLK, PS2_PIN_DATA);
+        DBG_PRINT("  Mouse    CLK: GPIO%d, DATA: GPIO%d\n", PS2_MOUSE_CLK, PS2_MOUSE_DATA);
+        if (!ps2_init(PIO_PS2KBD, PS2_PIN_CLK, PS2_MOUSE_CLK)) {
+            printf("WARNING: PS/2 PIO init failed\n");
+        }
+
+        // Initialize PS/2 keyboard wrapper (uses unified driver for PIO)
+        ps2kbd_init();
+
+        // Initialize PS/2 mouse device (reset, detect IntelliMouse, enable streaming)
+        ps2_mouse_init_device();
+    }
+#else
+    DBG_PRINT("PS/2 not present on this board; USB HID is the only input\n");
+#endif
+
+    // Initialize USB HID keyboard (if enabled)
+#ifdef USB_HID_ENABLED
+    DBG_PRINT("Initializing USB HID keyboard...\n");
+    usbkbd_init();
+#endif
+
+    // Initialize NES/SNES gamepad (if pins defined for this board)
+#ifdef NESPAD_GPIO_CLK
+    if (board_is_rp2350pc()) {
+        // GPIO9, the pad's latch on the PICO-PC, is the SD chip select here
+        DBG_PRINT("Olimex RP2350pc: skipping NES gamepad (pins in use)\n");
+    } else {
+    DBG_PRINT("Initializing NES gamepad...\n");
+    DBG_PRINT("  CLK: GPIO%d, DATA: GPIO%d, LATCH: GPIO%d\n",
+              NESPAD_GPIO_CLK, NESPAD_GPIO_DATA, NESPAD_GPIO_LATCH);
+    if (nespad_begin(clock_get_hz(clk_sys) / 1000,
+                     NESPAD_GPIO_CLK, NESPAD_GPIO_DATA, NESPAD_GPIO_LATCH)) {
+        DBG_PRINT("  NES gamepad initialized\n");
+    } else {
+        DBG_PRINT("  NES gamepad init failed (PIO unavailable)\n");
+    }
+    }
+#endif
+
+    return true;
+}
+
+//=============================================================================
+// Emulator Initialization
+//=============================================================================
+
+static bool init_emulator(void) {
+    // Load configuration
+    load_default_config();
+
+    // Try to load config from SD card
+    if (load_config_from_sd("config.ini") != 0) {
+        DBG_PRINT("Using default configuration\n");
+    }
+
+    DBG_PRINT("\nEmulator configuration:\n");
+    DBG_PRINT("  Memory: %ld MB\n", config.mem_size / (1024 * 1024));
+    DBG_PRINT("  VGA Memory: %ld KB\n", config.vga_mem_size / 1024);
+    DBG_PRINT("  CPU: %d86\n", config.cpu_gen);
+    DBG_PRINT("  BIOS: %s\n", config.bios ? config.bios : "(none)");
+    DBG_PRINT("  VGA BIOS: %s\n", config.vga_bios ? config.vga_bios : "(none)");
+    DBG_PRINT("  Floppy A: %s\n", config.fdd[0] ? config.fdd[0] : "(none)");
+    DBG_PRINT("  Floppy B: %s\n", config.fdd[1] ? config.fdd[1] : "(none)");
+
+    DBG_PRINT("  QSPI PSRAM: %lu KB; guest RAM: %lu KB\n",
+              (unsigned long)(psram_get_size() / 1024),
+              (unsigned long)(config.mem_size / 1024));
+
+#if REMOTE_MEM
+    /* Claim a window of the slave's SRAM immediately above local RAM.
+     * Measured at 89 cycles per access against 182 for the master's own
+     * PSRAM, so this region is twice as fast as the memory below it.
+     *
+     * Done before pc_new() because it extends phys_mem_size, and that is
+     * what lets load/store pass these addresses through to the
+     * dispatch in pload/pstore. */
+    {
+        uint32_t rbytes = remote_mem_init((uint32_t)config.mem_size,
+                                          REMOTE_MEM_BYTES);
+        if (rbytes) {
+            g_bench[5] = remote_mem_selftest();
+            g_bench[4] = remote_mem_rtt();
+            config.mem_size += rbytes;
+            DBG_PRINT("  Remote tier: +%lu KB (total %ld MB)\n",
+                      (unsigned long)(rbytes / 1024u),
+                      config.mem_size / (1024 * 1024));
+        } else {
+            DBG_PRINT("  Remote tier unavailable; PSRAM only\n");
+        }
+    }
+#endif
+
+    /*
+     * Bring up the slave's sector cache.
+     *
+     * Placed here, not in init_hardware(): the link's PIO divider is
+     * derived from clk_sys when the state machines are configured, and
+     * config.ini raises this board from 378 to 504 MHz during hardware
+     * init. This is also the call site where the remote-memory tier was
+     * known to work, which matters because an earlier placement inside
+     * init_hardware() hung the boot.
+     *
+     * Harmless with no slave attached: the cache stays disabled and
+     * every access goes to the card as before.
+     */
+    dc_init();
+
+    // Create PC instance
+    DBG_PRINT("\nCreating PC instance...\n");
+#if EXEC1_OVERLAY
+    /* the CPU in SRAM: the classic interpreter or the JIT (config.ini jit=) */
+    cpui386_select_core(config_get_jit());
+    DBG_PRINT("CPU: %s\n", config_get_jit() ? "real-mode JIT" : "classic interpreter");
+#endif
+    /* the disk images are INT 13h's (hle/int13.c), not an emulated controller's;
+     * boot=sd (frankdos.ini): no hard disk image, the SD card is C: */
+    extern bool hle_boot_sd;
+    extern void netredirect_set_letter(char letter);
+    hle_boot_sd = config_get_boot_sd();
+    if (hle_boot_sd)
+        netredirect_set_letter('C');
+    int13_set_images(image_dir, config.fdd[0], config.fdd[1],
+                     hle_boot_sd ? NULL : config.ata[0], hle_boot_sd ? NULL : config.ata[1]);
+    for (int i = 0; i < 4; i++)
+        config.ata[i] = NULL;
+    config.fdd[0] = config.fdd[1] = NULL;
+    /* the top of PSRAM is the native arena (fdos/dosrt.h), not the guest's */
+    if (config.mem_size != 8l << 20) {
+        printf("ERROR: the native DOS needs 8 MB of PSRAM (have %ld KB)\n", config.mem_size / 1024);
+        return false;
+    }
+    config.mem_size -= FDOS_ARENA_BYTES;
+#if JIT16
+    /* the JIT's store of compiled blocks, under the kernel's data (jit16.h) */
+    if (config_get_jit() == 1)
+        config.mem_size -= JIT_STORE_BYTES;
+#endif
+    pc = pc_new(vga_redraw, platform_poll, NULL, NULL, &config);
+#if JIT16
+    if (config_get_jit() == 1)
+        jit_store_init((uint8_t *)PSRAM_BASE_ADDR + (8u << 20) - FDOS_ARENA_BYTES - JIT_STORE_BYTES, JIT_STORE_BYTES);
+#endif
+    dosrt_psram_init();
+    if (!pc) {
+        printf("ERROR: Failed to create PC instance\n");
+        return false;
+    }
+
+    // Give ISR direct access to VGA register state.
+    // From this point the ISR reads cr[], ar[] at the right moment.
+    vga_hw_set_vga_state(pc->vga);
+
+    // Ensure emulator starts unpaused
+    pc->paused = 0;
+
+    // Initialize disk UI
+    DBG_PRINT("Initializing Disk UI...\n");
+    diskui_init();
+
+    // Initialize settings UI
+    DBG_PRINT("Initializing Settings UI...\n");
+    settingsui_init();
+
+    // Initialize config save module with current values from PCConfig
+    // (these override INI values if not present in [frank-386] section)
+    config_set_cpu_gen(config.cpu_gen);
+    config_set_fpu(config.fpu);
+    config_set_redirector(config.redirector);
+    // Hardware settings are loaded from [frank-386] section via parse_frank_386_ini
+    config_clear_changes();
+
+    // Apply audio/mouse enable settings from config to PC instance
+    // This allows disabling devices for performance improvement
+    pc->pcspk_enabled = config_get_pcspeaker();
+    pc->adlib_enabled = config_get_adlib();
+    pc->sb16_enabled = config_get_soundblaster();
+    pc->tandy_enabled = config_get_tandy();
+    pc->covox_enabled = config_get_covox();
+    pc->mpu401_enabled = config_get_mpu401();
+    pc->dss_enabled = config_get_dss();
+    pc->mouse_enabled = config_get_mouse() || config_get_nes_mouse();
+    pc->joystick_enabled = config_get_nes_joystick() || config_get_usb_joystick();
+    DBG_PRINT("  Audio: PC Speaker=%d, Adlib=%d, SB16=%d, MPU401=%d, Tandy=%d, Covox=%d, DSS=%d, Mouse=%d\n",
+              pc->pcspk_enabled, pc->adlib_enabled, pc->sb16_enabled, pc->mpu401_enabled,
+              pc->tandy_enabled, pc->covox_enabled, pc->dss_enabled, pc->mouse_enabled);
+
+    // No SeaBIOS or VGA BIOS: the machine is brought up natively (hle/boot.c)
+    hle_boot(pc);
+
+    return true;
+}
+
+/* Every software reboot goes through here (frank-ecat's platform_reboot):
+ * core 1 is stopped (it may be reading PSRAM) and the PSRAM taken out of
+ * QPI mode first, or the boot ROM cannot read the flash after a warm reset. */
+void __attribute__((noreturn)) platform_reboot(bool bootsel) {
+    if (get_core_num() == 0) {
+        /* forced off, then released: it restarts into the boot ROM, which
+         * waits for a launch. Left forced off, the bit survives the reboot. */
+        hw_set_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+        while (!(psm_hw->frce_off & PSM_FRCE_OFF_PROC1_BITS)) tight_loop_contents();
+        busy_wait_us(10);
+        hw_clear_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+        busy_wait_us(10);
+    }
+    save_and_disable_interrupts();
+    psram_reset_to_spi();
+    if (bootsel) reset_usb_boot(0, 0);
+    watchdog_reboot(0, 0, 0);
+    while (1) tight_loop_contents();
+}
+
+/* "~C put PATH SIZE~", then SIZE raw bytes: a file to the SD card, made
+ * with its directories (frank-ecat's console_put; tools/upload.py). The
+ * console may be a UART with no flow control and a 32-byte FIFO, so the
+ * sender waits for a "+" after every 512 bytes, while they are written. */
+static void console_put(const char *path, unsigned size) {
+    char dir[200];
+    strncpy(dir, path, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = 0;
+    for (char *p = dir + 1; *p; p++)
+        if (*p == '/') { *p = 0; f_mkdir(dir); *p = '/'; }
+    FIL *const fp = &util_fil;
+    if (f_open(fp, path, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+        printf("PUT FAIL open %s\n", path);
+        return;
+    }
+    printf("PUT READY %u\n", size);
+    static uint8_t buf[512];
+    unsigned got = 0, n = 0;
+    uint32_t sum = 0;
+    bool ok = true;
+    while (got < size) {
+        int c = getchar_timeout_us(3000000);
+        if (c < 0) { ok = false; break; }
+        buf[n++] = (uint8_t)c;
+        sum = sum * 31 + (uint8_t)c;
+        got++;
+        if (n == sizeof(buf) || got == size) {
+            UINT w;
+            if (f_write(fp, buf, n, &w) != FR_OK || w != n) { ok = false; break; }
+            n = 0;
+            putchar('+');
+            stdio_flush();
+        }
+    }
+    f_close(fp);
+    printf(ok ? "\nPUT OK %u %08lx\n" : "\nPUT FAIL at %u %08lx\n", got, (unsigned long)sum);
+}
+
+/* "~C type TEXT~": TEXT typed into the guest (autotype's key map) */
+static void console_cmd(char *line) {
+    char path[200];
+    unsigned size;
+    if (sscanf(line, "put %199s %u", path, &size) == 2)
+        console_put(path, size);
+    else if (!strncmp(line, "type ", 5))
+        autotype_text(line + 5);
+    else if (sscanf(line, "insert %c %199s", &(char){0}, path) == 2 &&
+             (line[7] == 'a' || line[7] == 'b' || line[7] == 'A' || line[7] == 'B')) {
+        /* a floppy image from the card's 386/ into A: or B: (the disk UI's insertdisk) */
+        int drive = (line[7] | 0x20) - 'a';
+        printf("insert %c: %s: %s\n", 'A' + drive, path, insertdisk(drive, true, false, path) ? "ok" : "failed");
+    }
+    else if (!strncmp(line, "eject ", 6) &&
+             (line[6] == 'a' || line[6] == 'b' || line[6] == 'A' || line[6] == 'B')) {
+        /* the floppy out of A: or B:, and config.ini saved without it */
+        int drive = (line[6] | 0x20) - 'a';
+        ejectdisk(drive, true);
+        config_save_all();
+        printf("eject %c: saved\n", 'A' + drive);
+    }
+    else if (sscanf(line, "jit %d", &(int){0}) == 1) {   /* the jit setting, saved: at the next boot */
+        /* into frankdos.ini, its jit= line only: config_save_all() would write
+         * a config.ini of its own, without the disks INT 13h took over */
+        int on = atoi(line + 4) != 0;
+        FIL *const fp = &util_fil;
+        static char ini[1024] __attribute__((section(".psram_bss"))), out[1100] __attribute__((section(".psram_bss")));
+        UINT n = 0;
+        if (f_open(fp, CONFIG_PLATFORM_DIR "/frankdos.ini", FA_READ) == FR_OK) {
+            f_read(fp, ini, sizeof ini - 1, &n);
+            f_close(fp);
+        }
+        ini[n] = 0;
+        size_t k = 0;
+        bool done = false;
+        for (char *l = ini; *l; ) {
+            char *e = strchr(l, '\n');
+            size_t len = e ? (size_t)(e - l + 1) : strlen(l);
+            if (!strncmp(l, "jit=", 4)) {
+                k += snprintf(out + k, sizeof out - k, "jit=%d\n", on);
+                done = true;
+            } else if (k + len < sizeof out) {
+                memcpy(out + k, l, len);
+                k += len;
+            }
+            l += len;
+        }
+        if (!done)
+            k += snprintf(out + k, sizeof out - k, "%s[frank-386]\njit=%d\n", k && out[k - 1] != '\n' ? "\n" : "", on);
+        UINT w = 0;
+        bool ok = f_open(fp, CONFIG_PLATFORM_DIR "/frankdos.ini", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK &&
+                  f_write(fp, out, (UINT)k, &w) == FR_OK && w == k;
+        if (ok)
+            f_close(fp);
+        printf(ok ? "jit=%d saved in frankdos.ini (next boot)\n" : "jit=%d: frankdos.ini not written\n", on);
+    }
+    else if (sscanf(line, "cat %199s", path) == 1) {     /* a (small) file from the card */
+        FIL *const fp = &util_fil;
+        static char buf[256];
+        UINT n;
+        if (f_open(fp, path, FA_READ) != FR_OK) { printf("cat: no %s\n", path); return; }
+        printf("--- %s\n", path);
+        while (f_read(fp, buf, sizeof buf, &n) == FR_OK && n) {
+            fwrite(buf, 1, n, stdout);
+            stdio_flush();
+        }
+        f_close(fp);
+        printf("\n--- end\n");
+    }
+    else if (sscanf(line, "rm %199s", path) == 1) {      /* a file off the card */
+        printf("rm %s: %s\n", path, f_unlink(path) == FR_OK ? "ok" : "failed");
+    }
+    else if (!strncmp(line, "mouse ", 6)) {      /* "mouse DX DY BUTTONS": the PS/2 mouse moved */
+        int dx = 0, dy = 0, b = 0;
+        sscanf(line + 6, "%d %d %d", &dx, &dy, &b);
+        if (pc && pc->mouse)
+            ps2_mouse_event(pc->mouse, dx, dy, 0, b);
+    }
+    else if (!strcmp(line, "screen")) {        /* the text screen, as text */
+        hle_screen();
+    }
+    else if (!strcmp(line, "jit")) {             /* the real-mode JIT's counters */
+#if JIT16
+        extern uint32_t jit_stat_runs, jit_stat_insns, jit_stat_blocks, jit_stat_flushes, jit_stat_bails,
+            jit_stat_invals, jit_stat_evicts, jit_stat_rekeys, jit_stat_steps2, jit_stat_recomp;
+        extern uint32_t jit_stat_scale;
+        printf("jit: scale mask %lu, ", (unsigned long)jit_stat_scale);
+        printf("jit: blocks %lu flushes %lu invals %lu evicts %lu rekeys %lu recomp %lu steps2 %lu runs %lu insns %lu bails %lu\n",
+               (unsigned long)jit_stat_blocks, (unsigned long)jit_stat_flushes, (unsigned long)jit_stat_invals,
+               (unsigned long)jit_stat_evicts, (unsigned long)jit_stat_rekeys, (unsigned long)jit_stat_recomp,
+               (unsigned long)jit_stat_steps2, (unsigned long)jit_stat_runs, (unsigned long)jit_stat_insns,
+               (unsigned long)jit_stat_bails);
+        extern uint32_t jit_stat_restores, jit_stat_stored, jit_stat_stalerec;
+        printf("jit: store: stored %lu restored %lu stale %lu\n", (unsigned long)jit_stat_stored,
+               (unsigned long)jit_stat_restores, (unsigned long)jit_stat_stalerec);
+#else
+        printf("jit: not in this build\n");
+#endif
+    }
+    else if (!strcmp(line, "ps") || !strcmp(line, "ps0")) {    /* the PC sampler (PC_SAMPLE builds) */
+#if PC_SAMPLE
+        if (line[2])
+            ps_clear();
+        else
+            ps_report(300);
+#else
+        printf("ps: not in this build (-DPC_SAMPLE=ON)\n");
+#endif
+    }
+    else if (!strcmp(line, "cds")) {             /* the kernel's drives */
+        extern void fdos_dump_cds(void);
+        fdos_dump_cds();
+    }
+    else if (sscanf(line, "dbg21 %d", &(int){0}) == 1) {  /* log the next N INT 21h calls */
+        extern int fdos_dbg21_left, fdos_dbg_intcall;
+        fdos_dbg21_left = fdos_dbg_intcall = atoi(line + 6);
+    }
+    else if (sscanf(line, "dbg13 %d", &(int){0}) == 1) {  /* log the next N INT 13h requests */
+        extern int int13_dbg_left;
+        int13_dbg_left = atoi(line + 6);
+    }
+    else if (!strcmp(line, "regs")) {          /* the guest's CPU and the BIOS's counters */
+        hle_report();
+    }
+    else if (!strcmp(line, "beep")) {          /* PIT 2 and the speaker: the sound path */
+        hle_beep(pc, 880, 1000);
+        printf("beep done\n");
+    }
+    else if (!strcmp(line, "mem")) {           /* the SRAM heap's room (platform_rp2350.c) */
+        extern void heap_report(void);
+        heap_report();
+    }
+#ifdef SDIO_PIN_CMD
+    else if (!strcmp(line, "sd")) {           /* where the card's time went, the caches */
+        extern void sd_stats_report(void);
+        sd_stats_report();
+    }
+    else if (!strcmp(line, "sdbench")) {      /* the card's raw speeds (sd_sdio.c) */
+        extern void sd_bench(void);
+        sd_bench();
+    }
+#endif
+    else if (sscanf(line, "rd %199s", path) == 1) {     /* a file read through FatFs, timed */
+        FIL *const fp = &util_fil;
+        enum { RD_BUF = 4096 };
+        uint8_t *buf = malloc(RD_BUF);      /* (for the command only: SRAM is tight) */
+        if (!buf) { printf("rd: no memory\n"); return; }
+        if (f_open(fp, path, FA_READ) != FR_OK) { printf("rd: no %s\n", path); free(buf); return; }
+        uint64_t t0 = time_us_64();
+        UINT n, total = 0;
+        while (f_read(fp, buf, RD_BUF, &n) == FR_OK && n) total += n;
+        uint64_t us = time_us_64() - t0;
+        f_close(fp);
+        free(buf);
+        printf("rd %s: %u bytes in %llu ms, %llu KB/s\n", path, total, us / 1000,
+               (unsigned long long)total * 1000000 / 1024 / (us + 1));
+    }
+    else
+        printf("? %s\n", line);
+}
+
+/* Console commands for the bench (bytes from stdio: the UART or USB CDC):
+ * "~BOOT~" reboots into BOOTSEL (then picotool load -x), "~RST~" reboots,
+ * "~STAT~" prints the HDMI output's counters, "~C ...~" console_cmd. */
+static void console_poll(void) {
+    static const char *const cmds[] = {"~BOOT~", "~RST~", "~STAT~"};
+    static unsigned pos[3];
+    static char cline[256];
+    static int cpos = -1;                /* in a "~C ...~": its length so far */
+    static int cprev;
+    int ch;
+    while ((ch = getchar_timeout_us(0)) >= 0) {
+        if (cpos >= 0) {
+            if (ch == '~') {
+                cline[cpos] = 0;
+                cpos = -1;
+                console_cmd(cline);
+            } else if (cpos < (int)sizeof(cline) - 1)
+                cline[cpos++] = (char)ch;
+            continue;
+        }
+        if (cprev == '~' && ch == 'C') {
+            cprev = 0;
+            if ((ch = getchar_timeout_us(100000)) == ' ') { cpos = 0; continue; }
+            if (ch < 0) continue;
+        }
+        cprev = ch;
+        for (int c = 0; c < 3; c++) {
+            const char *m = cmds[c];
+            pos[c] = (ch == m[pos[c]]) ? pos[c] + 1 : (ch == m[0]);
+            if (m[pos[c]]) continue;
+            pos[c] = 0;
+            if (c == 2) {
+                extern bool SELECT_VGA;
+                if (!SELECT_VGA)
+                    printf("\nHDMI: frames %lu, line IRQ max %lu us, starved frames %lu, "
+                           "restarts %lu, audio underruns %lu, drops %lu\n",
+                           (unsigned long)hdmi_frame_count, (unsigned long)hdmi_irq_max_us,
+                           (unsigned long)hdmi_underruns, (unsigned long)hdmi_resyncs,
+                           (unsigned long)hdmi_audio_underruns, (unsigned long)hdmi_audio_drops);
+                hdmi_irq_max_us = 0;
+                continue;
+            }
+            printf("\nrebooting%s\n", c == 0 ? " to BOOTSEL" : "");
+            sleep_ms(20);
+            platform_reboot(c == 0);
+        }
+    }
+}
+
+bool timer_callback(repeating_timer_t *rt);
+void vga_hw_process_deferred(void);
+#define MIXER_TICK_US (1000000 / SOUND_FREQUENCY) /* 22: 45.45 kHz */
+static bool __not_in_flash_func(timer_callback0)(repeating_timer_t *rt) {
+    /* The timer ticks in whole microseconds; skip a tick now and then so
+     * the mixer averages SOUND_FREQUENCY exactly (HDMI audio takes 44.1 kHz,
+     * and the sound devices assume it). */
+    static uint32_t phase;
+    phase += MIXER_TICK_US * SOUND_FREQUENCY;
+    if (phase >= 1000000) {
+        phase -= 1000000;
+        timer_callback(rt);
+    }
+    vga_hw_process_deferred();
+    return true;
+}
+// to call DMA wait not from ISR for timer
+bool repeat_me_often(void);
+static void __not_in_flash_func(core1_entry)(void) {
+
+    DBG_PRINT("[Core 1] Initializing video...\n");
+    DBG_PRINT("  Base pin: GPIO%d\n", VGA_BASE_PIN);
+    vga_hw_init();
+    sleep_ms(100);
+    vga_initialized = true;
+
+    DBG_PRINT("Initializing runtime audio output...\n");
+    audio_set_enabled(false);
+    audio_init();
+    audio_set_volume(config_get_volume());
+    audio_set_enabled(true);
+    config_clear_changes();
+    extern bool SELECT_VGA;
+    while(!initialized) {
+        sleep_ms(1);
+        if (!SELECT_VGA) hdmi_watchdog(); /* core 0's boot can stall it */
+        __dmb();
+    }
+    static repeating_timer_t m_timer = { 0 };
+    /* frank-dos: a pool of core 1's own. add_repeating_timer_us() takes the
+     * default pool, made on core 0 at boot, and the mixer ran in core 0's
+     * interrupts: 5-8% of the CPU's time, sampled */
+    alarm_pool_t *pool = alarm_pool_create_with_unused_hardware_alarm(4);
+    if (pool)
+        alarm_pool_add_repeating_timer_us(pool, -MIXER_TICK_US, timer_callback0, pc, &m_timer);
+    else
+        add_repeating_timer_us(-MIXER_TICK_US, timer_callback0, pc, &m_timer);
+    while(1) {
+        repeat_me_often();
+#if ADLIB_CORE1
+        adlib_core1_poll(pc->adlib);    /* between FIFO refills: 16 samples a call */
+#endif
+        if (!SELECT_VGA) hdmi_watchdog();
+        sleep_us(1);
+    }
+    __unreachable();
+}
+
+//=============================================================================
+// Welcome Screen
+//=============================================================================
+
+static void show_welcome_screen(void) {
+    // Welcome screen dimensions
+    int wx = 14, wy = 6, ww = 51, wh = 14;
+
+    osd_clear();
+
+    // Draw the window content once (static, won't flicker)
+    osd_draw_box(wx, wy, ww, wh, OSD_ATTR_BORDER);
+    osd_fill(wx + 1, wy + 1, ww - 2, wh - 2, ' ', OSD_ATTR_NORMAL);
+
+    // Title
+    osd_print_center(wy + 3, "FRANK DOS", OSD_ATTR(OSD_YELLOW, OSD_BLUE));
+
+    // Version
+    char version_str[32];
+    snprintf(version_str, sizeof(version_str), "Version %d.%02d",
+             FRANK_DOS_VERSION_MAJOR, FRANK_DOS_VERSION_MINOR);
+    osd_print_center(wy + 5, version_str, OSD_ATTR_NORMAL);
+
+    // Author
+    osd_print_center(wy + 6, "by Mikhail Matveev & DnCraptor", OSD_ATTR_NORMAL);
+    osd_print_center(wy + 7, "https://github.com/rh1tech/frank-dos", OSD_ATTR_NORMAL);
+
+    // Hardware info
+    char hw_str[50];
+    snprintf(hw_str, sizeof(hw_str), "RP: %d, PSRAM: %d, Flash: %d",
+             config_get_cpu_freq(), config_get_psram_freq(), config_get_flash_freq());
+    osd_print_center(wy + 9, hw_str, OSD_ATTR(OSD_LIGHTCYAN, OSD_BLUE));
+
+    // Platform (green text)
+#ifdef BOARD_M1
+    osd_print_center(wy + 10, "Platform: M1", OSD_ATTR(OSD_LIGHTGREEN, OSD_BLUE));
+#elif defined(BOARD_M2)
+    osd_print_center(wy + 10, "Platform: M2", OSD_ATTR(OSD_LIGHTGREEN, OSD_BLUE));
+#elif defined(BOARD_PC)
+    osd_print_center(wy + 10, "Platform: Olimex PICO-PC", OSD_ATTR(OSD_LIGHTGREEN, OSD_BLUE));
+#elif defined(BOARD_Z2)
+    osd_print_center(wy + 10, "Platform: RP2350-PiZero", OSD_ATTR(OSD_LIGHTGREEN, OSD_BLUE));
+#elif defined(BOARD_C2)
+    osd_print_center(wy + 10, "Platform: FRANK Core 2", OSD_ATTR(OSD_LIGHTGREEN, OSD_BLUE));
+#elif defined(BOARD_NX)
+    osd_print_center(wy + 10, "Platform: FRANK Next", OSD_ATTR(OSD_LIGHTGREEN, OSD_BLUE));
+#else
+    osd_print_center(wy + 10, "Platform: Unknown", OSD_ATTR(OSD_LIGHTGREEN, OSD_BLUE));
+#endif
+
+    osd_show();
+
+    // Animate plasma background for 7 seconds (700 frames at ~10ms each)
+    // Window area is skipped by osd_draw_plasma_background, so it won't flicker
+    for (int frame = 0; frame < 700; frame++) {
+        int is_down = 0, keycode = 0;
+#ifdef BOARD_HAS_PS2
+        ps2kbd_tick();
+        ps2kbd_get_key(&is_down, &keycode);
+#endif
+#ifdef USB_HID_ENABLED
+        if (!is_down) {
+            usbkbd_tick();
+            usbkbd_get_key(&is_down, &keycode);
+        }
+#endif
+        if (is_down) break;
+        osd_draw_plasma_background(frame * 3, wx, wy, ww, wh);
+        sleep_ms(10);
+    }
+
+    osd_hide();
+}
+
+//=============================================================================
+// Main Entry Point
+//=============================================================================
+
+int main(void) {
+    /*
+     * Core 0's stack grows down from the top of SCRATCH_Y towards the
+     * data placed at its bottom (spread8_lut, the HDMI DMA pointers).
+     * Nothing stops it there by default, and an overflow silently
+     * corrupts those tables (PR #9). Fence the stack off at the end of
+     * that data, so an overflow faults where it happens instead.
+     */
+    extern char __scratch_y_end__[];
+    uintptr_t stack_limit = ((uintptr_t)__scratch_y_end__ + 7u) & ~7u;
+    __asm volatile ("msr msplim, %0" : : "r" (stack_limit));
+
+    // Initialize stdio (USB Serial or UART depending on USB HID mode)
+    stdio_init_all();
+    #ifdef PICO_DEFAULT_LED_PIN
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    #endif
+    DBG_PRINT("\n\n");
+    DBG_PRINT("============================================\n");
+    DBG_PRINT("  FRANK DOS - native DOS for RP2350\n");
+    DBG_PRINT("  Version %d.%02d\n", FRANK_DOS_VERSION_MAJOR, FRANK_DOS_VERSION_MINOR);
+    DBG_PRINT("============================================\n\n");
+
+#ifndef USB_HID_ENABLED
+    // Wait for USB Serial connection (with timeout)
+    // Only when USB CDC is enabled (USB HID disabled)
+    DBG_PRINT("Waiting for USB Serial connection...\n");
+    DBG_PRINT("(Press any key or wait %d seconds)\n\n", USB_CONSOLE_DELAY_MS / 1000);
+
+    absolute_time_t deadline = make_timeout_time_ms(USB_CONSOLE_DELAY_MS);
+    while (!stdio_usb_connected() && !time_reached(deadline)) {
+        sleep_ms(100);
+    }
+
+    if (stdio_usb_connected()) {
+        DBG_PRINT("USB Serial connected!\n\n");
+    } else {
+        DBG_PRINT("Timeout - continuing without USB Serial\n\n");
+    }
+#elif USB_CDC_CONSOLE
+    // USB HID on PIO-USB: the native port is the CDC console (and the UART)
+    usb_console_init();
+    absolute_time_t deadline = make_timeout_time_ms(USB_CONSOLE_DELAY_MS);
+    while (!usb_console_connected() && !time_reached(deadline)) {
+        sleep_ms(100);
+    }
+    DBG_PRINT("USB HID on PIO-USB, console on native USB and UART\n\n");
+#else
+    // USB HID mode: using UART for debug output
+    DBG_PRINT("USB HID mode: USB port used for keyboard input\n");
+    DBG_PRINT("Debug output via UART\n\n");
+#endif
+
+    // Print board configuration
+    DBG_PRINT("Board Configuration:\n");
+#ifdef BOARD_M1
+    DBG_PRINT("  Board: M1\n");
+#elif defined(BOARD_M2)
+    DBG_PRINT("  Board: M2\n");
+#elif defined(BOARD_PC)
+    DBG_PRINT("  Board: PC (Olimex PICO-PC)\n");
+#elif defined(BOARD_Z2)
+    DBG_PRINT("  Board: Z2 (Waveshare RP2350-PiZero)\n");
+#elif defined(BOARD_C2)
+    DBG_PRINT("  Board: C2 (FRANK Core 2 master)\n");
+#elif defined(BOARD_NX)
+    DBG_PRINT("  Board: NX (FRANK Next master)\n");
+#else
+    DBG_PRINT("  Board: Unknown\n");
+#endif
+    DBG_PRINT("  CPU Speed: %d MHz\n", CPU_CLOCK_MHZ);
+    DBG_PRINT("  PSRAM Speed: %d MHz\n", PSRAM_MAX_FREQ_MHZ);
+    DBG_PRINT("\n");
+
+    // Initialize hardware
+    if (!init_hardware()) {
+        printf("\nHardware initialization failed!\n");
+        while (true) {
+            sleep_ms(1000);
+        }
+    }
+
+    // Initialize emulator
+    if (!init_emulator()) {
+        printf("\nEmulator initialization failed!\n");
+        while (true) {
+            sleep_ms(1000);
+        }
+    }
+
+    {   /* what pc_new() left of the SRAM heap: the margin SRAM changes eat */
+        extern void heap_report(void);
+        heap_report();
+    }
+
+    // Start the core-0 cycle counter before emulation begins.
+    prof_init();
+    ps_init(clock_get_hz(clk_sys), 10000u);   /* 10 kHz PC sampling */
+    prof_mem_bench();
+#if defined(SUBSYS_PROFILE) && defined(BOARD_C2) && !REMOTE_MEM
+    /* Skipped when REMOTE_MEM is on: init_emulator() has already brought
+     * the link up, and a second linkf_init() would re-claim the PIO. */
+    prof_link_bench();
+#endif
+
+    initialized = true;
+
+    // HDMI DMA starts at normal priority to avoid starving SD/PSRAM during
+    // BIOS loading.  Now that all ROMs are in PSRAM, raise DMA priority for
+    // glitch-free video output.
+    {
+        extern bool SELECT_VGA;
+        if (!SELECT_VGA) {
+            extern void hdmi_set_dma_high_priority(void);
+            hdmi_set_dma_high_priority();
+            DBG_PRINT("HDMI DMA priority raised\n");
+        }
+    }
+
+    // Show welcome screen
+    DBG_PRINT("\nAbout to show welcome screen...\n");
+    if(*(uint32_t*)(0x20000000 + (512ul << 10) - 32) != 0x1927fa52) // magic to fast reboot
+        show_welcome_screen();
+    DBG_PRINT("Welcome screen done.\n");
+    hle_beep(pc, 880, 150);     /* the sound path, heard before any guest runs */
+
+    DBG_PRINT("\nStarting emulation...\n");
+
+#if THROTTLING
+    // Frame rate throttling for audio sync
+    // Target ~60fps to match audio processing rate (16666us per frame)
+    uint64_t frame_start_time = time_us_64();
+    const uint64_t target_frame_time_us = 16666; // 60Hz = 16.666ms per frame
+    int frame_step_count = 0;
+    const int steps_per_frame = 100; // Number of outer loop iterations per frame
+#endif
+    // Retrace-based frame submission state
+    static int last_vga_mode = -1;
+
+    // Main emulation loop (Core 0)
+    while (true) {
+        // Skip CPU execution when paused (disk UI or settings UI active)
+        if (pc->paused) {
+            // Still poll keyboard to handle UI input
+            poll_keyboard();
+            console_poll();
+
+            // Animate plasma background for active UI
+            if (diskui_is_open()) {
+                diskui_animate();
+            } else if (settingsui_is_open()) {
+                settingsui_animate();
+            }
+
+            sleep_ms(16);  // ~60Hz polling/animation rate
+            continue;
+        }
+
+        autotype_tick();
+
+        // Run CPU steps - batch multiple steps for efficiency
+        if (hle_cpu_running) {
+            for (int i = 0; i < 10; i++) {
+                /* the FreeDOS kernel waiting on the guest: a batch, then it
+                 * looks again (native_done: at once, no guest at all) */
+                if (!(dosrt_active() && pc->cpu->native_done))
+                    pc_step(pc);
+                throughput_tick();
+                dosrt_after_batch();
+            }
+        } else {
+            pc_vga_step(pc);    /* the screen without a guest: retrace, redraw */
+            sleep_us(500);
+        }
+
+        // Poll keyboard less frequently (every 20 iterations ~5ms)
+        // Keyboard events are buffered, so missing a few cycles is fine
+        static int poll_counter = 0;
+        if (++poll_counter >= 20) {
+            poll_counter = 0;
+            poll_keyboard();
+            console_poll();
+        }
+
+        // Check for reset request
+        if (pc->reset_request) {
+            pc->reset_request = 0;
+            *(uint32_t*)(0x20000000 + (512ul << 10) - 32) = 0x1927fa52; // magic to fast reboot
+            hle_boot(pc);
+        }
+
+        // Check for settings UI restart request (requires full RP reset)
+        if (settingsui_restart_requested()) {
+            settingsui_clear_restart();
+            DBG_PRINT("Settings changed - triggering RP reset...\n");
+            // Full hardware reset via watchdog
+            *(uint32_t*)(0x20000000 + (512ul << 10) - 32) = 0x1927fa52; // magic to fast reboot
+            platform_reboot(false);
+        }
+
+        // Check for shutdown
+        if (pc->shutdown_state) {
+            break;
+        }
+#if THROTTLING
+        // Frame rate throttling for audio synchronization
+        frame_step_count++;
+        if (frame_step_count >= steps_per_frame) {
+            frame_step_count = 0;
+            uint64_t now = time_us_64();
+            uint64_t elapsed = now - frame_start_time;
+
+            // If we finished the frame early, wait for the remaining time
+            if (elapsed < target_frame_time_us) {
+                uint64_t sleep_time = target_frame_time_us - elapsed;
+                sleep_us(sleep_time);
+            }
+            // Reset frame timer for next frame
+            frame_start_time = time_us_64();
+        }
+#endif
+    }
+
+    DBG_PRINT("\nEmulation stopped.\n");
+    *(uint32_t*)(0x20000000 + (512ul << 10) - 32) = 0x1927fa52; // magic to fast reboot
+    platform_reboot(false);
+    __unreachable();
+    return 0;
+}

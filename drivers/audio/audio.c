@@ -1,0 +1,391 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2022 Vincent Mistler
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+#include "pc.h"
+#include "audio.h"
+#include "dss.h"
+#include "adlib.h"
+#include "hdmi.h"
+#include "board_config.h"
+#include <pico/time.h>
+
+#if HAS_AUDIO_PWM
+#include <hardware/pwm.h>
+#endif
+#include <hardware/clocks.h>
+#include <hardware/gpio.h>
+#if I2S_CODEC_TLV320
+#include "tlv320.h"
+#endif
+
+static uint8_t volume = 0; // 0 - MAX vol, 16 - silece (for i2s, for pwm - 12)
+
+#if HAS_AUDIO_I2S
+#ifndef I2S_PIO
+#define I2S_PIO pio2    /* RP2350 only */
+#endif
+/**
+ * return the default i2s context used to store information about the setup
+ */
+i2s_config_t i2s_get_default_config(void) {
+    i2s_config_t i2s_config = {
+            .sample_freq = 44100,
+            .channel_count = 2,
+    		.data_pin = I2S_DATA_PIN,
+	    	.clock_pin_base = I2S_CLOCK_PIN_BASE,
+            .pio = I2S_PIO,
+            .sm = 0,
+            .dma_channel = 0,
+            .dma_buf = NULL,
+            .dma_trans_count = 0
+    };
+    return i2s_config;
+}
+
+/**
+ * Initialize the I2S driver. Must be called before calling i2s_write or i2s_dma_write
+ * i2s_config: I2S context obtained by i2s_get_default_config()
+ */
+void i2s_init(i2s_config_t *i2s_config) {
+    uint8_t func;
+    if      (i2s_config->pio == pio0) func = GPIO_FUNC_PIO0;
+    else if (i2s_config->pio == pio1) func = GPIO_FUNC_PIO1;
+    else                              func = GPIO_FUNC_PIO2;  // RP2350 only
+    gpio_set_function(i2s_config->data_pin, func);
+    gpio_set_function(i2s_config->clock_pin_base, func);
+    gpio_set_function(i2s_config->clock_pin_base + 1, func);
+
+    i2s_config->sm = pio_claim_unused_sm(i2s_config->pio, true);
+
+    /* Set PIO clock */
+    uint32_t system_clock_frequency = clock_get_hz(clk_sys);
+    uint32_t divider = system_clock_frequency * 4 / i2s_config->sample_freq; // avoid arithmetic overflow
+
+#ifdef I2S_CS4334
+    uint offset = pio_add_program(i2s_config->pio, &audio_i2s_cs4334_program);
+    audio_i2s_cs4334_program_init(i2s_config->pio, i2s_config->sm , offset, i2s_config->data_pin , i2s_config->clock_pin_base);
+    divider >>= 3;
+#else
+    uint offset = pio_add_program(i2s_config->pio, &audio_i2s_program);
+    audio_i2s_program_init(i2s_config->pio, i2s_config->sm, offset, i2s_config->data_pin, i2s_config->clock_pin_base);
+#endif
+
+    pio_sm_set_clkdiv_int_frac(i2s_config->pio, i2s_config->sm, divider >> 8u, divider & 0xffu);
+
+    pio_sm_set_enabled(i2s_config->pio, i2s_config->sm, false);
+    /* Allocate memory for the DMA buffer */
+    i2s_config->dma_buf = malloc(i2s_config->dma_trans_count * sizeof(uint32_t));
+
+    /* Direct Memory Access setup */
+    i2s_config->dma_channel = dma_claim_unused_channel(true);
+
+    dma_channel_config dma_config = dma_channel_get_default_config(i2s_config->dma_channel);
+    channel_config_set_read_increment(&dma_config, true);
+    channel_config_set_write_increment(&dma_config, false);
+    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32);
+
+    volatile uint32_t *addr_write_DMA = &(i2s_config->pio->txf[i2s_config->sm]);
+    channel_config_set_dreq(&dma_config, pio_get_dreq(i2s_config->pio, i2s_config->sm, true));
+    dma_channel_configure(i2s_config->dma_channel,
+                          &dma_config,
+                          addr_write_DMA,    // Destination pointer
+                          i2s_config->dma_buf,                        // Source pointer
+                          i2s_config->dma_trans_count,                // Number of 32 bits words to transfer
+                          false                                       // Start immediately
+    );
+    pio_sm_set_enabled(i2s_config->pio, i2s_config->sm, true);
+}
+
+/**
+ * Write samples to I2S directly and wait for completion (blocking)
+ * i2s_config: I2S context obtained by i2s_get_default_config()
+ *     sample: pointer to an array of len x 32 bits samples
+ *             Each 32 bits sample contains 2x16 bits samples, 
+ *             one for the left channel and one for the right channel
+ *        len: length of sample in 32 bits words
+ */
+void i2s_write(const i2s_config_t *i2s_config, const int16_t *samples, const size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        pio_sm_put_blocking(i2s_config->pio, i2s_config->sm, (uint32_t) samples[i]);
+    }
+}
+
+/**
+ * Write samples to DMA buffer and initiate DMA transfer (non blocking)
+ * i2s_config: I2S context obtained by i2s_get_default_config()
+ *     sample: pointer to an array of dma_trans_count x 32 bits samples
+ */
+void __not_in_flash_func(i2s_dma_write)(i2s_config_t *i2s_config, const int16_t *samples) {
+    /* Wait the completion of the previous DMA transfer */
+    dma_channel_wait_for_finish_blocking(i2s_config->dma_channel);
+    /* Copy samples into the DMA buffer */
+    for (int i = 0; i < i2s_config->dma_trans_count * 2; ++i) {
+        i2s_config->dma_buf[i] = samples[i] >> volume;
+    }
+    /* Initiate the DMA transfer */
+    dma_channel_transfer_from_buffer_now(i2s_config->dma_channel,
+                                         i2s_config->dma_buf,
+                                         i2s_config->dma_trans_count);
+}
+
+/**
+ * Adjust the output volume
+ * i2s_config: I2S context obtained by i2s_get_default_config()
+ *     volume: desired volume between 0 (highest. volume) and 16 (lowest volume)
+ */
+void i2s_volume(i2s_config_t *i2s_config, uint8_t vol) {
+    if (vol > 16) vol = 16;
+    volume = vol;
+}
+
+/**
+ * Increases the output volume
+ */
+void i2s_increase_volume(i2s_config_t *i2s_config) {
+    if (volume > 0) {
+        volume--;
+    }
+}
+
+/**
+ * Decreases the output volume
+ */
+void i2s_decrease_volume(i2s_config_t *i2s_config) {
+    if (volume < 16) {
+        volume++;
+    }
+}
+
+static i2s_config_t i2s_config;
+#endif
+#if HAS_AUDIO_PWM || FEATURE_AUDIO_HW
+static pwm_config pwm;
+#endif
+
+static bool audio_use_i2s = false;
+static int boot_audio_output = AUDIO_OUTPUT_AUTO;
+
+void audio_set_boot_output(int output) {
+    if (output >= AUDIO_OUTPUT_AUTO && output <= AUDIO_OUTPUT_I2S)
+        boot_audio_output = output;
+}
+
+#if HAS_AUDIO_I2S && HAS_AUDIO_PWM
+extern int testPins(uint32_t pin0, uint32_t pin1);
+static uint8_t link_i2s_code = 0xFF;
+#endif
+
+static uint8_t prev = 0;
+void audio_set_enabled(bool v) {
+    if (v) {
+        volume = prev;
+    } else {
+        prev = volume;
+        volume = 16;
+    }
+}
+
+void audio_set_volume(uint8_t vol) {
+    prev = 16 - vol;
+}
+
+uint8_t audio_get_volume(void) {
+    return 16 - prev;
+}
+
+
+void audio_init(void) {
+#if HAS_AUDIO_I2S && HAS_AUDIO_PWM
+    if (boot_audio_output == AUDIO_OUTPUT_AUTO) {
+        if (link_i2s_code == 0xFF) {
+            // Drain residual charge before probing shared audio pins.
+            gpio_init(I2S_DATA_PIN);
+            gpio_set_dir(I2S_DATA_PIN, GPIO_OUT);
+            gpio_put(I2S_DATA_PIN, 0);
+            gpio_init(I2S_CLOCK_PIN_BASE);
+            gpio_set_dir(I2S_CLOCK_PIN_BASE, GPIO_OUT);
+            gpio_put(I2S_CLOCK_PIN_BASE, 0);
+            sleep_ms(50);
+            gpio_deinit(I2S_DATA_PIN);
+            gpio_deinit(I2S_CLOCK_PIN_BASE);
+
+            link_i2s_code = testPins(I2S_DATA_PIN, I2S_CLOCK_PIN_BASE);
+            // HIGH under pull-down means external back-feed, not an I2S DAC.
+            if (link_i2s_code & 0b10100) link_i2s_code = 0;
+        }
+        audio_use_i2s = link_i2s_code != 0;
+    } else {
+        audio_use_i2s = (boot_audio_output == AUDIO_OUTPUT_I2S);
+    }
+#elif HAS_AUDIO_I2S
+    audio_use_i2s = true;
+#else
+    audio_use_i2s = false;
+#endif
+
+#if HAS_AUDIO_I2S
+    if (audio_use_i2s) {
+        i2s_config = i2s_get_default_config();
+        i2s_config.sample_freq = SOUND_FREQUENCY;
+        i2s_config.dma_trans_count = 1;
+        i2s_volume(&i2s_config, 0);
+        i2s_init(&i2s_config);
+        sleep_ms(100);
+#if I2S_CODEC_TLV320
+        /* the codec's PLL locks to BCLK: configured once the clocks run */
+        tlv320_init(CODEC_I2C_SDA_PIN, CODEC_I2C_SCL_PIN);
+#endif
+        return;
+    }
+#endif
+#if HAS_AUDIO_PWM
+    pwm = pwm_get_default_config();
+    // The Olimex RP2350pc has an audio codec instead; its pins are not
+    // mapped yet, so leave GPIO27/28 alone there (silent, not driven)
+    if (!board_is_rp2350pc()) {
+        gpio_set_function(PWM_LEFT_PIN, GPIO_FUNC_PWM);
+        gpio_set_function(PWM_RIGHT_PIN, GPIO_FUNC_PWM);
+    }
+#ifdef BEEPER_PIN
+    gpio_set_function(BEEPER_PIN, GPIO_FUNC_PWM);
+#endif
+    pwm_config_set_clkdiv(&pwm, 1.0f);
+    pwm_config_set_wrap(&pwm, (1 << 12) - 1);
+    uint sln_l = pwm_gpio_to_slice_num(PWM_LEFT_PIN);
+    pwm_init(sln_l, &pwm, true);
+    uint sln_r = pwm_gpio_to_slice_num(PWM_RIGHT_PIN);
+    if (sln_r != sln_l) pwm_init(sln_r, &pwm, true);
+#ifdef BEEPER_PIN
+    uint sln_b = pwm_gpio_to_slice_num(BEEPER_PIN);
+    if (sln_r != sln_b && sln_l != sln_b) pwm_init(sln_b, &pwm, true);
+#endif
+#elif FEATURE_AUDIO_HW
+    init_74hc595();
+    pwm = pwm_get_default_config();
+    gpio_set_function(PCM_PIN, GPIO_FUNC_PWM);
+    pwm_config_set_clkdiv(&pwm, 1.0f);
+    pwm_config_set_wrap(&pwm, (1 << 12) - 1);
+    pwm_init(pwm_gpio_to_slice_num(PCM_PIN), &pwm, true);
+#endif
+}
+
+static int16_t samples[2] = { 0 };
+
+//=============================================================================
+// Core 1 Entry Point (Audio processing)
+//=============================================================================
+bool __not_in_flash_func(timer_callback)(repeating_timer_t *rt) {
+    static uint32_t dss_phase = 0;
+    static int dss_v = 0;
+    PC* pc = (PC*)rt->user_data;
+
+    /* Disney Sound Source owns a fixed 7 kHz playback clock. The mixer runs
+     * at 44.1 kHz, so keep the exact 7000/44100 ratio with a phase accumulator
+     * instead of quantizing 1/7000 s to whole microseconds. */
+    if (pc->dss_enabled) {
+        dss_phase += 7000;
+        if (dss_phase >= 44100) {
+            dss_phase -= 44100;
+            dss_v = dss_sample();
+        }
+    }
+    // output:
+    int b_v = 0;
+    int r_v = 0;
+    int l_v = 0;
+    if (pc->pcspk_enabled) {
+        b_v = pcspk_sample(pc->pcspk);
+    }
+    if (pc->covox_enabled && pc->covox_sample) {
+        int16_t sample = ((int16_t)pc->covox_sample - 127) << 8;
+        r_v += sample;
+        l_v += sample;
+    }
+    if (pc->tandy_enabled) {
+        int16_t sample = sn76489_sample(); // 16-bit
+        r_v += sample;
+        l_v += sample;
+    }
+    if (pc->mpu401_enabled) {
+        int16_t sample = midi_sample();
+        r_v += sample;
+        l_v += sample;
+    }
+    if (pc->adlib_enabled) {
+        int16_t sample = adlib_getsample(pc->adlib);
+        r_v += sample;
+        l_v += sample;
+    }
+    if (pc->sb16_enabled) {
+        sb16_getsample(pc->sb16, &r_v, &l_v);
+    }
+    r_v += dss_v;
+    l_v += dss_v;
+    {
+        /* HDMI audio (a no-op on VGA): the I2S mix, after the volume */
+        int hr = r_v, hl = l_v;
+        if (b_v) { hr = hl = 32767; }
+        if (hr > 32767) hr = 32767;
+        if (hr < -32768) hr = -32768;
+        if (hl > 32767) hl = 32767;
+        if (hl < -32768) hl = -32768;
+        hdmi_audio_push((int16_t)(hl >> volume), (int16_t)(hr >> volume));
+    }
+#if HAS_AUDIO_I2S
+    if (audio_use_i2s) {
+        if (b_v) { r_v = l_v = 32767; }
+        if (r_v > 32767) r_v = 32767;
+        if (r_v < -32768) r_v = -32768;
+        if (l_v > 32767) l_v = 32767;
+        if (l_v < -32768) l_v = -32768;
+        samples[0] = r_v;
+        samples[1] = l_v;
+        return true;
+    }
+#endif
+#if HAS_AUDIO_PWM
+    r_v >>= volume;
+    l_v >>= volume;
+    uint16_t ur_v = (r_v + 32768) >> 4;
+    uint16_t ul_v = (l_v + 32768) >> 4;
+    if (ur_v > 4095) ur_v = 4095;
+    if (ul_v > 4095) ul_v = 4095;
+#ifdef BEEPER_PIN
+    b_v = b_v ? (4095 >> volume) : 0;
+    pwm_set_gpio_level(BEEPER_PIN, b_v);
+#else
+    if (b_v) { r_v = l_v = 32767; }
+#endif
+    pwm_set_gpio_level(PWM_RIGHT_PIN, ur_v);
+    pwm_set_gpio_level(PWM_LEFT_PIN, ul_v);
+#endif
+    return true;
+}
+
+// to call DMA-wait not from ISR for timer
+bool __not_in_flash_func(repeat_me_often)(void) {
+#if HAS_AUDIO_I2S
+    if (audio_use_i2s) i2s_dma_write(&i2s_config, samples);
+#endif
+    return true;
+}

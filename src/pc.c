@@ -1,0 +1,1366 @@
+#include "pc.h"
+#include "guest_mem.h"
+#include "bulk_bounce.h"
+#include "ide.h"
+#include "dss.h"
+#include "misc.h"
+#include "profile_subsys.h"
+#include "codeprofile.h"
+#include "gameport.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <hardware/watchdog.h>
+
+#include "mpu401.c.inl"
+
+uint8_t *guest_phys_mem = NULL;
+unsigned long guest_phys_mem_size = 0;
+void *guest_iomem = NULL;
+uint8_t guest_bulk_buf[GUEST_BULK_BUF_SIZE];
+void netredirect_init(CPUI386 *cpu, int enable);
+
+#ifdef USEKVM
+#define cpu_raise_irq cpukvm_raise_irq
+#define cpu_get_cycle cpukvm_get_cycle
+#else
+#define cpu_raise_irq cpui386_raise_irq
+#define cpu_get_cycle cpui386_get_cycle
+#endif
+
+/* ---- Emulink FDD: simple virtual floppy on ports 0xF1F0/0xF1F4 ----------
+ * Protocol (matches tiny386 / this BIOS):
+ *   OUT 0xF1F0, cmd    – set command (resets argi to 0)
+ *   OUT 0xF1F4, arg    – push argument (up to 4); executes after 3rd arg
+ *   IN  0xF1F0         – read 32-bit status / result
+ *   REP INSB  0xF1F4   – bulk read data (cmd 0x101)
+ *   REP OUTSB 0xF1F4   – bulk write data (cmd 0x102)
+ *
+ * Commands:
+ *   0x000 – identify: status = 0xAA55FF00
+ *   0x100 – probe drives: status bit6=drv0 present, bit2=drv1 present
+ *   0x101 – read sectors:  args[0]=drive, args[1]=CHS(c<<16|h<<8|s), args[2]=count
+ *   0x102 – write sectors: same args, then REP OUTSB
+ * -------------------------------------------------------------------------*/
+
+static void emulink_exec(PC *pc)
+{
+	switch (pc->emulink.cmd) {
+	case 0x000:
+		pc->emulink.status = 0xaa55ff00;
+		pc->emulink.cmd    = -1;
+		break;
+	case 0x100:
+		pc->emulink.status = fdds_types(); 
+		pc->emulink.cmd = -1;
+		break;
+	case 0x101: /* read */
+	case 0x102: /* write */
+		if (pc->emulink.argi == 3) {
+			uint8_t  drv  = (uint8_t)pc->emulink.args[0];
+			uint32_t chs  = pc->emulink.args[1];
+			uint32_t cnt  = pc->emulink.args[2];
+			if (drv >= 2 || !fdd_is_inserted(drv)) {
+				pc->emulink.status = 0x80; /* error */
+				pc->emulink.cmd    = -1;
+				break;
+			}
+			int c = (int)(chs >> 16);
+			int h = (int)((chs >> 8) & 0xff);
+			int s = (int)(chs & 0xff);
+			uint16_t heads = fdd_get_heads(drv);
+			uint16_t sects = fdd_get_sects(drv);
+			if (heads == 0 || sects == 0) {
+				pc->emulink.status = 0x80;
+				pc->emulink.cmd    = -1;
+				break;
+			}
+			uint32_t lba = (uint32_t)(c * heads + h) * sects + (uint32_t)(s - 1);
+			FIL *fil = fdd_get_file(drv);
+			FRESULT fr = f_lseek(fil, lba * 512u);
+			if (fr != FR_OK) {
+				pc->emulink.status = 0x80;
+				pc->emulink.cmd    = -1;
+			} else {
+				pc->emulink.status    = 0;
+				pc->emulink.dataleft  = (int)(cnt * 512u);
+			}
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static uint32_t emulink_read32(PC *pc)
+{
+	return pc->emulink.status;
+}
+
+static void emulink_cmd_write(PC *pc, uint32_t val)
+{
+	pc->emulink.cmd  = (int)val;
+	pc->emulink.argi = 0;
+	emulink_exec(pc);
+}
+
+static void emulink_arg_write(PC *pc, uint32_t val)
+{
+	if (pc->emulink.argi < 4)
+		pc->emulink.args[pc->emulink.argi++] = val;
+	emulink_exec(pc);
+}
+
+/* bulk read: called from pc_io_read_string for port 0xF1F4 */
+static int emulink_data_read(PC *pc, uint32_t addr, int size, int count)
+{
+	if (pc->emulink.cmd == 0x101 && pc->emulink.argi == 3) {
+		uint8_t drv = (uint8_t)pc->emulink.args[0];
+		if (!fdd_is_inserted(drv)) goto err;
+		int len = size * count;
+		if (len > pc->emulink.dataleft) goto err;
+		FIL *fil = fdd_get_file(drv);
+		UINT br = 0;
+        uint8_t *buf = guest_bulk_buf;
+        for (int i = 0; i < len; i += GUEST_BULK_BUF_SIZE) {
+            UINT l = (UINT)(len - i);
+            if (l > GUEST_BULK_BUF_SIZE) l = GUEST_BULK_BUF_SIZE;
+            FRESULT fr = f_read(fil, buf, l, &br);
+            if (fr != FR_OK || br != l) goto err;
+            guest_write_block(addr + (uint32_t)i, buf, l);
+        }
+		pc->emulink.dataleft -= len;
+		if (pc->emulink.dataleft == 0) {
+			pc->emulink.cmd    = -1;
+			pc->emulink.status = 0;
+		}
+		return count;
+	}
+err:
+	pc->emulink.cmd    = -1;
+	pc->emulink.status = 0x80;
+	return count;
+}
+
+/* bulk write: called from pc_io_write_string for port 0xF1F4 */
+static int emulink_data_write(PC *pc, uint32_t addr, int size, int count)
+{
+	if (pc->emulink.cmd == 0x102 && pc->emulink.argi == 3) {
+		uint8_t drv = (uint8_t)pc->emulink.args[0];
+		if (!fdd_is_inserted(drv)) goto err;
+		int len = size * count;
+		if (len > pc->emulink.dataleft) goto err;
+		FIL *fil = fdd_get_file(drv);
+		UINT bw = 0;
+        uint8_t *buf = guest_bulk_buf;
+        for (int i = 0; i < len; i += GUEST_BULK_BUF_SIZE) {
+            UINT l = (UINT)(len - i);
+            if (l > GUEST_BULK_BUF_SIZE) l = GUEST_BULK_BUF_SIZE;
+            guest_read_block(addr + (uint32_t)i, buf, l);
+            FRESULT fr = f_write(fil, buf, l, &bw);
+            if (fr != FR_OK || bw != l) goto err;
+        }
+		pc->emulink.dataleft -= len;
+		if (pc->emulink.dataleft == 0) {
+			pc->emulink.cmd    = -1;
+			pc->emulink.status = 0;
+		}
+		return count;
+	}
+err:
+	pc->emulink.cmd    = -1;
+	pc->emulink.status = 0x80;
+	return count;
+}
+
+/* --------------------------------------------------------------------------*/
+#if TRACE_PORTS
+static FIL ports_log;
+#include <stdarg.h>
+void debug_write(const char *fmt, ...) {
+	char buf[256];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	if (n <= 0)
+		return;
+	if (n >= (int)sizeof(buf))
+		n = sizeof(buf) - 1;
+	UINT bw;
+	f_write(&ports_log, buf, n, &bw);
+	f_sync(&ports_log);
+}
+#else
+#define debug_write(...) (void)0
+#endif
+
+static __always_inline u8 _pc_io_read(void *o, int addr)
+{
+	cp_io_read();
+	PC *pc = o;
+	u8 val;
+
+	switch(addr) {
+	case 0x20: case 0x21: case 0xa0: case 0xa1:
+		val = i8259_ioport_read(pc->pic, addr);
+		return val;
+	case 0x3f8: case 0x3f9: case 0x3fa: case 0x3fb:
+	case 0x3fc: case 0x3fd: case 0x3fe: case 0x3ff:
+		val = 0xff;
+		if (pc->enable_serial)
+			val = u8250_reg_read(pc->serial, addr - 0x3f8);
+		return val;
+	case 0x2f8: case 0x2f9: case 0x2fa: case 0x2fb:
+	case 0x2fc: case 0x2fd: case 0x2fe: case 0x2ff:
+	case 0x2e8: case 0x2e9: case 0x2ea: case 0x2eb:
+	case 0x2ec: case 0x2ed: case 0x2ee: case 0x2ef:
+	case 0x3e8: case 0x3e9: case 0x3ea: case 0x3eb:
+	case 0x3ec: case 0x3ed: case 0x3ee: case 0x3ef:
+		return 0;
+	case 0x42:
+		/* read delay for PIT channel 2 */
+		/* certain guest code needs it to drive pc speaker properly */
+		usleep(0);
+		/* fall through */
+	case 0x40: case 0x41: case 0x43:
+		val = i8254_ioport_read(pc->pit, addr);
+		return val;
+	case 0x70: case 0x71:
+		val = cmos_ioport_read(pc->cmos, addr);
+		return val;
+	case 0x1f0: case 0x1f1: case 0x1f2: case 0x1f3:
+	case 0x1f4: case 0x1f5: case 0x1f6: case 0x1f7:
+		return ide_ioport_read(pc->ide, addr - 0x1f0);
+	case 0x170: case 0x171: case 0x172: case 0x173:
+	case 0x174: case 0x175: case 0x176: case 0x177:
+		return ide_ioport_read(pc->ide2, addr - 0x170);
+	case 0x3f6:
+		return ide_status_read(pc->ide);
+	case 0x376:
+		return ide_status_read(pc->ide2);
+	/* FDC ports 0x3F0-0x3F5, 0x3F7 (0x3F6 = IDE alt-status, handled above) */
+	case 0x3f0: case 0x3f1: case 0x3f2: case 0x3f3:
+	case 0x3f4: case 0x3f5:
+	case 0x3f7:
+		if (pc->fdc)
+			return fdc_ioport_read(pc->fdc, addr);
+		return 0xff;
+	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
+	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
+	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
+	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
+	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
+	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
+	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
+	case 0x3dc: case 0x3dd: case 0x3de: case 0x3df:
+		val = vga_ioport_read(pc->vga, addr);
+		return val;
+	case 0x92:
+		return pc->port92;
+	case 0x60:
+		val = kbd_read_data(pc->i8042, addr);
+		return val;
+	case 0x64:
+		val = kbd_read_status(pc->i8042, addr);
+		return val;
+	case 0x61:
+		val = pcspk_ioport_read(pc->pcspk);
+		return val;
+	case 0x220: case 0x221: case 0x222: case 0x223:
+	case 0x228: case 0x229:
+	case 0x388: case 0x389: case 0x38a: case 0x38b:
+		if (pc->adlib_enabled)
+			return adlib_read(pc->adlib, addr);
+		return 0xFF;
+	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
+		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 0);
+		return val;
+	/* NE2000 networking removed */
+	case 0x300: case 0x301: case 0x302: case 0x303:
+	case 0x304: case 0x305: case 0x306: case 0x307:
+	case 0x308: case 0x309: case 0x30a: case 0x30b:
+	case 0x30c: case 0x30d: case 0x30e: case 0x30f:
+	case 0x310: case 0x31f:
+		return 0xff;
+	case 0x00: case 0x01: case 0x02: case 0x03:
+	case 0x04: case 0x05: case 0x06: case 0x07:
+		val = i8257_read_chan(pc->isa_dma, addr - 0x00, 1);
+		return val;
+	case 0xf1f4: {
+		/* emulink: single-byte read (BIOS probes this way too) */
+		uint32_t v32 = emulink_read32(pc);
+		return (u8)(v32 & 0xff);
+	}
+	case 0x08: case 0x09: case 0x0a: case 0x0b:
+	case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+		val = i8257_read_cont(pc->isa_dma, addr - 0x08, 1);
+		return val;
+	case 0x81: case 0x82: case 0x83: case 0x87:
+		val = i8257_read_page(pc->isa_dma, addr - 0x80);
+		return val;
+	case 0x481: case 0x482: case 0x483: case 0x487:
+		val = i8257_read_pageh(pc->isa_dma, addr - 0x480);
+		return val;
+	case 0xc0: case 0xc1:
+		/* SN76489 is write-only; return 0xFF on read when Tandy active */
+		if (pc->tandy_enabled)
+			return 0xff;
+		val = i8257_read_chan(pc->isa_hdma, addr - 0xc0, 1);
+		return val;
+	case 0xc2: case 0xc4: case 0xc6:
+	case 0xc8: case 0xca: case 0xcc: case 0xce:
+		val = i8257_read_chan(pc->isa_hdma, addr - 0xc0, 1);
+		return val;
+	case 0xd0: case 0xd2: case 0xd4: case 0xd6:
+	case 0xd8: case 0xda: case 0xdc: case 0xde:
+		val = i8257_read_cont(pc->isa_hdma, addr - 0xd0, 1);
+		return val;
+	case 0x89: case 0x8a: case 0x8b: case 0x8f:
+		val = i8257_read_page(pc->isa_hdma, addr - 0x88);
+		return val;
+	case 0x489: case 0x48a: case 0x48b: case 0x48f:
+		val = i8257_read_pageh(pc->isa_hdma, addr - 0x488);
+		return val;
+	case 0x225:
+		if (pc->sb16_enabled) {
+			return sb16_mixer_read(pc->sb16, addr);
+		}
+		return 0xFF;
+	case 0x226: case 0x22a: case 0x22c: case 0x22d: case 0x22e: case 0x22f:
+		if (pc->sb16_enabled) {
+			return sb16_dsp_read(pc->sb16, addr);
+		}
+		return 0xFF;
+	case 0x200: case 0x201: case 0x202: case 0x203:
+	case 0x204: case 0x205: case 0x206: case 0x207:
+		/* Analog game port. When no joystick is configured this returns
+		 * 0xF0 - axes timed out, no buttons - which is exactly what an
+		 * empty adapter reads, so probing games behave as before. */
+		if (pc->joystick_enabled)
+			return gameport_read();
+		return 0xf0;
+	case 0x27A: // Covox Speech Thing
+		return 0;
+	// MPU-401
+	case 0x330:
+	case 0x331:
+		if (pc->mpu401_enabled)
+	        return mpu401_read(addr);
+		return 0xFF;
+	// Disney Sound Source
+	case 0x378:
+	case 0x379:
+		if (pc->dss_enabled)
+			return dss_in(addr);
+		return 0xFF;
+	/* LPT data ports (Covox): write-only DAC, reads return 0xFF */
+	case 0x278:
+		return 0xff;
+	/* LPT status ports: bit7=nBusy(1=ready), bits6..3=1 (idle/ready) */
+	case 0x279:
+		return 0xf8;
+	/* LPT control ports */
+	case 0x37a:
+		return 0x04;
+	default:
+		//fprintf(stderr, "in 0x%x <= 0x%x\n", addr, 0xff);
+		return 0xff;
+	}
+}
+
+static u8 pc_io_read(void *o, int addr) {
+	u8 r = _pc_io_read(o, addr);
+	debug_write("R8: %ph <- %02Xh\n", addr, r);
+	return r;
+}
+
+static __always_inline u16 _pc_io_read16(void *o, int addr)
+{
+	PC *pc = o;
+	u16 val;
+
+	switch(addr) {
+	case 0x1ce: case 0x1cf:
+		val = vbe_read(pc->vga, addr - 0x1ce);
+		return val;
+	/* IDE ports */
+	case 0x1f0:
+		return ide_data_readw(pc->ide);
+	case 0x170:
+		return ide_data_readw(pc->ide2);
+	case 0xcf8:
+		val = i440fx_read_addr(pc->i440fx, 0, 1);
+		return val;
+	case 0xcfc: case 0xcfe:
+		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 1);
+		return val;
+	/* NE2000 networking removed */
+	case 0x310:
+		return 0xffff;
+	case 0x220:
+		if (pc->adlib_enabled)
+			return adlib_read(pc->adlib, addr);
+		return 0xFFFF;
+	/* Game port. Games normally use IN AL, but a 16-bit read must not
+	 * silently return 0 - that reads as "axes already timed out" and the
+	 * stick looks stuck at one extreme. */
+	case 0x200: case 0x201: case 0x202: case 0x203:
+	case 0x204: case 0x205: case 0x206: case 0x207:
+		if (pc->joystick_enabled)
+			return 0xff00u | gameport_read();
+		return 0xfff0u;
+	default:
+		return 0;
+	}
+}
+
+static u16 pc_io_read16(void *o, int addr) {
+	u16 r = _pc_io_read16(o, addr);
+	debug_write("R16: %ph <- %04Xh\n", addr, r);
+	return r;
+}
+
+static __always_inline u32 _pc_io_read32(void *o, int addr)
+{
+	PC *pc = o;
+	u32 val;
+	switch(addr) {
+	/* IDE ports */
+	case 0x1f0:
+		return ide_data_readl(pc->ide);
+	case 0x170:
+		return ide_data_readl(pc->ide2);
+	case 0x3cc:
+		return (get_uticks() - pc->boot_start_time) / 1000;
+	case 0xcf8:
+		val = i440fx_read_addr(pc->i440fx, 0, 2);
+		return val;
+	case 0xcfc:
+		val = i440fx_read_data(pc->i440fx, 0, 2);
+		return val;
+	/* Emulink FDD status port */
+	case 0xf1f0:
+		return emulink_read32(pc);
+	default:
+		return 0;
+	}
+}
+
+static u32 pc_io_read32(void *o, int addr) {
+	u32 r = _pc_io_read32(o, addr);
+	debug_write("R32: %ph <- %08Xh\n", addr, r);
+	return r;
+}
+
+static int pc_io_read_string(void *o, int addr, uint32_t buf, int size, int count)
+{
+	debug_write("RS: %ph [%d / %d]\n", addr, size, count);
+	PC *pc = o;
+	switch(addr) {
+	case 0x1f0:
+		return ide_data_read_string(pc->ide, buf, size, count);
+	case 0x170:
+		return ide_data_read_string(pc->ide2, buf, size, count);
+	case 0xf1f4:
+		return emulink_data_read(pc, buf, size, count);
+	}
+	return 0;
+}
+
+#if EMULATE_LTEMS
+uint8_t ems_pages[4] = {0};
+uint32_t ems_backing_linear_base = 0;
+
+inline static void out_ems(const uint16_t port, const uint8_t data) {
+    ems_pages[port & 3] = data;
+}
+#endif
+
+static void pc_io_write(void *o, int addr, u8 val)
+{
+	cp_io_write();
+	debug_write("W8: %ph -> %02Xh\n", addr, val);
+	PC *pc = o;
+	switch(addr) {
+	case 0x80: case 0xed:
+		/* used by linux, for io delay */
+		return;
+	case 0x20: case 0x21: case 0xa0: case 0xa1:
+		i8259_ioport_write(pc->pic, addr, val);
+		return;
+	case 0x3f8: case 0x3f9: case 0x3fa: case 0x3fb:
+	case 0x3fc: case 0x3fd: case 0x3fe: case 0x3ff:
+		u8250_reg_write(pc->serial, addr - 0x3f8, val);
+		return;
+#if EMULATE_LTEMS
+    case 0x260: case 0x261: case 0x262: case 0x263:
+		out_ems(addr, val);
+        return;
+#endif
+	case 0x2f8: case 0x2f9: case 0x2fa: case 0x2fb:
+	case 0x2fc: case 0x2fd: case 0x2fe: case 0x2ff:
+	case 0x2e8: case 0x2e9: case 0x2ea: case 0x2eb:
+	case 0x2ec: case 0x2ed: case 0x2ee: case 0x2ef:
+	case 0x3e8: case 0x3e9: case 0x3ea: case 0x3eb:
+	case 0x3ec: case 0x3ed: case 0x3ee: case 0x3ef:
+		return;
+	case 0x40: case 0x41: case 0x42: case 0x43:
+		i8254_ioport_write(pc->pit, addr, val);
+		return;
+	case 0x70: case 0x71:
+		cmos_ioport_write(pc->cmos, addr, val);
+		return;
+	/* IDE ports */
+	case 0x1f0: case 0x1f1: case 0x1f2: case 0x1f3:
+	case 0x1f4: case 0x1f5: case 0x1f6: case 0x1f7:
+		ide_ioport_write(pc->ide, addr - 0x1f0, val);
+		return;
+	case 0x170: case 0x171: case 0x172: case 0x173:
+	case 0x174: case 0x175: case 0x176: case 0x177:
+		ide_ioport_write(pc->ide2, addr - 0x170, val);
+		return;
+	case 0x3f6:
+		ide_cmd_write(pc->ide, val);
+		return;
+	case 0x376:
+		ide_cmd_write(pc->ide2, val);
+		return;
+	/* FDC ports 0x3F0-0x3F5, 0x3F7 */
+	case 0x3f0: case 0x3f1: case 0x3f2: case 0x3f3:
+	case 0x3f4: case 0x3f5:
+	case 0x3f7:
+		if (pc->fdc)
+			fdc_ioport_write(pc->fdc, addr, val);
+		return;
+	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
+	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
+	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
+	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
+	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
+	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
+	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
+	case 0x3dc: case 0x3dd: case 0x3de: case 0x3df:
+		vga_ioport_write(pc->vga, addr, val);
+		return;
+	case 0x402:
+		return;
+	case 0x92:
+		pc->port92 = val;
+		cpu_set_a20(pc->cpu, (val >> 1) & 1);
+		return;
+	case 0x60:
+		kbd_write_data(pc->i8042, addr, val);
+		return;
+	case 0x64:
+		kbd_write_command(pc->i8042, addr, val);
+		return;
+	case 0x61:
+		pcspk_ioport_write(pc->pcspk, val);
+		return;
+	case 0x220: case 0x221: case 0x222: case 0x223:
+	case 0x228: case 0x229:
+	case 0x388: case 0x389: case 0x38a: case 0x38b:
+		if (pc->adlib_enabled)
+			adlib_write(pc->adlib, addr, val);
+		return;
+	case 0x8900:
+		switch (val) {
+		case 'S': if (pc->shutdown_state == 0) pc->shutdown_state = 1; break;
+		case 'h': if (pc->shutdown_state == 1) pc->shutdown_state = 2; break;
+		case 'u': if (pc->shutdown_state == 2) pc->shutdown_state = 3; break;
+		case 't': if (pc->shutdown_state == 3) pc->shutdown_state = 4; break;
+		case 'd': if (pc->shutdown_state == 4) pc->shutdown_state = 5; break;
+		case 'o': if (pc->shutdown_state == 5) pc->shutdown_state = 6; break;
+		case 'w': if (pc->shutdown_state == 6) pc->shutdown_state = 7; break;
+		case 'n': if (pc->shutdown_state == 7) pc->shutdown_state = 8; break;
+		default : pc->shutdown_state = 0; break;
+		}
+		return;
+	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
+		i440fx_write_data(pc->i440fx, addr - 0xcfc, val, 0);
+		return;
+	/* NE2000 networking removed */
+	case 0x300: case 0x301: case 0x302: case 0x303:
+	case 0x304: case 0x305: case 0x306: case 0x307:
+	case 0x308: case 0x309: case 0x30a: case 0x30b:
+	case 0x30c: case 0x30d: case 0x30e: case 0x30f:
+	case 0x310: case 0x31f:
+		return;
+	case 0x00: case 0x01: case 0x02: case 0x03:
+	case 0x04: case 0x05: case 0x06: case 0x07:
+		i8257_write_chan(pc->isa_dma, addr - 0x00, val, 1);
+		return;
+	case 0x08: case 0x09: case 0x0a: case 0x0b:
+	case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+		i8257_write_cont(pc->isa_dma, addr - 0x08, val, 1);
+		return;
+	case 0x81: case 0x82: case 0x83: case 0x87:
+		i8257_write_page(pc->isa_dma, addr - 0x80, val);
+		return;
+	case 0x481: case 0x482: case 0x483: case 0x487:
+		i8257_write_pageh(pc->isa_dma, addr - 0x480, val);
+		return;
+	/* 0xC0/0xC1: SN76489 data port when Tandy enabled, hdma ch0 otherwise.
+	 * 0xC2-0xCE: always hdma (Tandy only occupied 0xC0). */
+	case 0xc0: case 0xc1:
+		if (pc->tandy_enabled)
+			sn76489_out(val);
+		else
+			i8257_write_chan(pc->isa_hdma, addr - 0xc0, val, 1);
+		return;
+	case 0xc2: case 0xc4: case 0xc6:
+	case 0xc8: case 0xca: case 0xcc: case 0xce:
+		i8257_write_chan(pc->isa_hdma, addr - 0xc0, val, 1);
+		return;
+	case 0xd0: case 0xd2: case 0xd4: case 0xd6:
+	case 0xd8: case 0xda: case 0xdc: case 0xde:
+		i8257_write_cont(pc->isa_hdma, addr - 0xd0, val, 1);
+		return;
+	case 0x89: case 0x8a: case 0x8b: case 0x8f:
+		i8257_write_page(pc->isa_hdma, addr - 0x88, val);
+		return;
+	case 0x489: case 0x48a: case 0x48b: case 0x48f:
+		i8257_write_pageh(pc->isa_hdma, addr - 0x488, val);
+		return;
+	case 0x224:
+		if (pc->sb16_enabled) {
+			sb16_mixer_write_indexb(pc->sb16, addr, val);
+		}
+		return;
+	case 0x225:
+		if (pc->sb16_enabled) {
+			sb16_mixer_write_datab(pc->sb16, addr, val);
+		}
+		return;
+	case 0x226: case 0x22c:
+		if (pc->sb16_enabled) {
+			sb16_dsp_write(pc->sb16, addr, val);
+		}
+		return;
+	/* Tandy 3-Voice Sound (SN76489) - additional alias ports.
+	 * Primary port 0xC0 is handled above.
+	 * 0x1E0: Tandy 1000 SX/TX/HX data port
+	 * 0x2C0: Tandy 1000 A/B mirror */
+	case 0x1E0: case 0x2C0:
+		if (pc->tandy_enabled)
+			sn76489_out(val);
+		return;
+	/* Covox Speech Thing (parallel port DAC)
+	 * 0x278 = LPT2 data. */
+	case 0x278:
+		if (pc->covox_enabled)
+			pc->covox_sample = val;
+		return;
+	// MPU-401
+	case 0x330:
+	case 0x331:
+		if (pc->mpu401_enabled)
+			mpu401_write(addr, val);
+		return;
+	// Disney Sound Source
+    case 0x378:
+    case 0x37A:
+		if (pc->dss_enabled)
+			dss_out(addr, val);
+		return;
+	/* Game port: any write fires the axis one-shots. The value written
+	 * is irrelevant on real hardware and is ignored here too. */
+	case 0x200: case 0x201: case 0x202: case 0x203:
+	case 0x204: case 0x205: case 0x206: case 0x207:
+		if (pc->joystick_enabled)
+			gameport_write();
+		return;
+	/* LPT status/control ports are read-only - writes ignored */
+	case 0x379: case 0x279:
+	case 0x27a:
+		return;
+	default:
+///		fprintf(stderr, "out 0x%x => 0x%x\n", val, addr);
+		return;
+	}
+}
+
+static void pc_io_write16(void *o, int addr, u16 val)
+{
+	debug_write("W16: %ph -> %04Xh\n", addr, val);
+	PC *pc = o;
+	switch(addr) {
+	/* IDE ports */
+	case 0x1f0:
+		ide_data_writew(pc->ide, val);
+		return;
+	case 0x170:
+		ide_data_writew(pc->ide2, val);
+		return;
+    case 0x260: case 0x261: case 0x262: case 0x263:
+		pc_io_write(o, addr, (uint8_t) val);
+		pc_io_write(o, addr + 1, val >> 8);
+        return;
+	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
+	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
+	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
+	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
+	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
+	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
+	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
+	case 0x3dc: case 0x3dd: case 0x3de:
+		vga_ioport_write(pc->vga, addr, val & 0xff);
+		vga_ioport_write(pc->vga, addr + 1, (val >> 8) & 0xff);
+		return;
+	case 0x1ce: case 0x1cf:
+		vbe_write(pc->vga, addr - 0x1ce, val);
+		return;
+	case 0xcfc: case 0xcfe:
+		i440fx_write_data(pc->i440fx, addr - 0xcfc, val, 1);
+		return;
+	/* NE2000 networking removed */
+	case 0x310:
+		return;
+	default:
+///		fprintf(stderr, "outw 0x%x => 0x%x\n", val, addr);
+		return;
+	}
+}
+
+static void pc_io_write32(void *o, int addr, u32 val)
+{
+	debug_write("W32: %ph -> %08Xh\n", addr, val);
+	PC *pc = o;
+	switch(addr) {
+	/* IDE ports */
+	case 0x1f0:
+		ide_data_writel(pc->ide, val);
+		return;
+	case 0x170:
+		ide_data_writel(pc->ide2, val);
+		return;
+	case 0xcf8:
+		i440fx_write_addr(pc->i440fx, 0, val, 2);
+		return;
+	case 0xcfc:
+		i440fx_write_data(pc->i440fx, 0, val, 2);
+		return;
+	/* Emulink FDD command/data ports */
+	case 0xf1f0:
+		emulink_cmd_write(pc, val);
+		return;
+	case 0xf1f4:
+		emulink_arg_write(pc, val);
+		return;
+    case 0x260: case 0x261: case 0x262: case 0x263:
+		pc_io_write16(o, addr, (uint16_t) val);
+		pc_io_write16(o, addr + 2, val >> 16);
+        return;
+	default:
+///		do_log(stderr, "outd 0x%x => 0x%x\n", val, addr);
+		return;
+	}
+}
+
+static int pc_io_write_string(void *o, int addr, uint32_t buf, int size, int count)
+{
+	debug_write("WS: %ph [%d / %d]\n", addr, size, count);
+	PC *pc = o;
+	switch(addr) {
+	case 0x1f0:
+		return ide_data_write_string(pc->ide, buf, size, count);
+	case 0x170:
+		return ide_data_write_string(pc->ide2, buf, size, count);
+	case 0xf1f4:
+		return emulink_data_write(pc, buf, size, count);
+	}
+	return 0;
+}
+
+void pc_vga_step(void *o)
+{
+	PC *pc = o;
+	int refresh = vga_step(pc->vga);
+	if (refresh) {
+		vga_refresh(pc->vga, pc->redraw, pc->redraw_data, 0);
+	}
+}
+
+void __not_in_flash_func(pc_step)(PC *pc)
+{
+	PROF_T(t_total);
+	PROF_T(t_dev);
+	/* reset_request is handled in main.c via load_bios_and_reset() */
+	int refresh = vga_step(pc->vga);
+	i8254_update_irq(pc->pit);
+	cmos_update_irq(pc->cmos);
+	if (pc->enable_serial)
+		u8250_update(pc->serial);
+	kbd_step(pc->i8042);
+	i8257_dma_run(pc->isa_dma);
+	i8257_dma_run(pc->isa_hdma);
+	if (pc->fdc) fdc_tick(pc->fdc);
+	PROF_ADD(t_dev, devices);
+#if !defined(BUILD_ESP32) && !defined(RP2350_BUILD)
+	pc->poll(pc->redraw_data);
+	if (refresh) {
+		vga_refresh(pc->vga, pc->redraw, pc->redraw_data,
+			    pc->full_update != 0);
+		if (pc->full_update == 2)
+			pc->full_update = 0;
+	}
+#else
+	{
+		PROF_T(t_poll);
+		if (pc->poll) pc->poll(pc->redraw_data);
+		PROF_ADD(t_poll, poll);
+	}
+	{
+		PROF_T(t_refresh);
+		if (refresh && pc->redraw) {
+			vga_refresh(pc->vga, pc->redraw, pc->redraw_data,
+				    pc->full_update != 0);
+			if (pc->full_update == 2)
+				pc->full_update = 0;
+		}
+		PROF_ADD(t_refresh, refresh);
+	}
+#endif
+#ifdef USEKVM
+	cpukvm_step(pc->cpu, 4096);
+#else
+#if defined(BUILD_ESP32)
+	cpui386_step(pc->cpu, 512);
+#elif defined(RP2350_BUILD)
+	PROF_T(t_cpu);
+	cpui386_step(pc->cpu, 4096);
+	PROF_ADD(t_cpu, cpu);
+#else
+	cpui386_step(pc->cpu, 10240);
+#endif
+#endif
+#if SUBSYS_PROFILE
+	PROF_ADD(t_total, total);
+	if (++g_prof.steps >= PROF_REPORT_STEPS)
+		prof_report();
+#endif
+
+#ifdef I386_PROFILE
+	/* Dump profile every ~10M instructions */
+	static uint32_t prof_dump_counter = 0;
+	prof_dump_counter += 4096;
+	if (prof_dump_counter >= 10000000) {
+		i386_profile_dump();
+		i386_profile_reset();
+		prof_dump_counter = 0;
+	}
+#endif
+}
+
+static void raise_irq(void *o, PicState2 *s)
+{
+	cpu_raise_irq(o);
+}
+
+static int read_irq(void *o)
+{
+	PicState2 *s = o;
+	return i8259_read_irq(s);
+}
+
+static void set_irq(void *o, int irq, int level)
+{
+	PicState2 *s = o;
+	return i8259_set_irq(s, irq, level);
+}
+
+static void set_pci_vga_bar(void *opaque, int bar_num, uint32_t addr, bool enabled)
+{
+	PC *pc = opaque;
+	if (enabled)
+		pc->pci_vga_ram_addr = addr;
+	else
+		pc->pci_vga_ram_addr = -1;
+#ifdef USEKVM
+	if (enabled)
+		cpukvm_register_mem(pc->cpu, 2, addr, pc->vga_mem_size,
+				    pc->vga_mem);
+	else
+		cpukvm_register_mem(pc->cpu, 2, addr, 0,
+				    NULL);
+#endif
+}
+
+u8 iomem_read8(void *iomem, uword addr)
+{
+	PC *pc = iomem;
+	uword vga_addr2 = pc->pci_vga_ram_addr;
+	if (addr >= vga_addr2) {
+		addr -= vga_addr2;
+		if (addr < pc->vga_mem_size)
+			return pc->vga_mem[addr];
+		else
+			return 0;
+	}
+	return vga_mem_read(pc->vga, addr - 0xa0000);
+}
+
+void iomem_write8(void *iomem, uword addr, u8 val)
+{
+	PC *pc = iomem;
+	uword vga_addr2 = pc->pci_vga_ram_addr;
+	if (addr >= vga_addr2) {
+		addr -= vga_addr2;
+		if (addr < pc->vga_mem_size)
+			pc->vga_mem[addr] = val;
+		return;
+	}
+	vga_mem_write(pc->vga, addr - 0xa0000, val);
+}
+
+static u16 iomem_read16(void *iomem, uword addr)
+{
+	return iomem_read8(iomem, addr) |
+		((u16) iomem_read8(iomem, addr + 1) << 8);
+}
+
+static void iomem_write16(void *iomem, uword addr, u16 val)
+{
+	PC *pc = iomem;
+	// fast path for vga ram
+	uword vga_addr2 = pc->pci_vga_ram_addr;
+	if (addr >= vga_addr2) {
+		addr -= vga_addr2;
+		if (addr + 1 < pc->vga_mem_size)
+			*(uint16_t *)&(pc->vga_mem[addr]) = val;
+		return;
+	}
+	vga_mem_write16(pc->vga, addr - 0xa0000, val);
+}
+
+static u32 iomem_read32(void *iomem, uword addr)
+{
+	return iomem_read16(iomem, addr) |
+		((u32) iomem_read16(iomem, addr + 2) << 16);
+}
+
+static void iomem_write32(void *iomem, uword addr, u32 val)
+{
+	PC *pc = iomem;
+	// fast path for vga ram
+	uword vga_addr2 = pc->pci_vga_ram_addr;
+	if (addr >= vga_addr2) {
+		uword vga_addr2 = pc->pci_vga_ram_addr;
+		addr -= vga_addr2;
+		if (addr + 3 < pc->vga_mem_size)
+			*(uint32_t *)&(pc->vga_mem[addr]) = val;
+		return;
+	}
+	vga_mem_write32(pc->vga, addr - 0xa0000, val);
+}
+
+static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
+{
+	PC *pc = iomem;
+	// fast path for vga ram
+	uword vga_addr2 = pc->pci_vga_ram_addr;
+	if (addr >= vga_addr2) {
+		uword vga_addr2 = pc->pci_vga_ram_addr;
+		addr -= vga_addr2;
+		if (addr + len < pc->vga_mem_size) {
+			memcpy(pc->vga_mem + addr, buf, len);
+			return true;
+		}
+		return false;
+	}
+	return vga_mem_write_string(pc->vga, addr - 0xa0000, buf, len);
+}
+
+static void pc_reset_request(void *p)
+{
+	PC *pc = p;
+	pc->reset_request = 1;
+}
+
+extern uint8_t gfx_buffer[256ul << 10];
+
+static CMOS *_pc_cmos_for_floppy = NULL;
+static void cmos_floppy_update(uint8_t ta, uint8_t tb) {
+    cmos_set_floppy_types(_pc_cmos_for_floppy, ta, tb);
+    cmos_set(_pc_cmos_for_floppy, 0x14, 0x41); // 0x14 <= 0x41 (2 fdds)
+    cmos_update_checksum(_pc_cmos_for_floppy);
+}
+
+static PC *_pc_for_fdc = NULL;
+static void fdc_mediachange_notify(int drive) {
+    if (_pc_for_fdc && _pc_for_fdc->fdc)
+        fdc_media_changed(_pc_for_fdc->fdc, drive);
+}
+
+/* CD-ROM media change callback: called by disk layer when a CD-ROM drive
+ * is inserted (filename != NULL) or ejected (filename == NULL).
+ *
+ * drivenum = ata[] index (0..3), NOT the diskui selected_drive (0..4):
+ *   ata[0] -> ide,  drive 0  (primary master)
+ *   ata[1] -> ide,  drive 1  (primary slave)
+ *   ata[2] -> ide2, drive 0  (secondary master)  <- DRIVE_CDROM_E via diskui
+ *   ata[3] -> ide2, drive 1  (secondary slave)
+ */
+static PC *_pc_for_cdrom = NULL;
+static void cdrom_change_notify(int drivenum, const char *filename, int was_present) {
+    if (!_pc_for_cdrom) return;
+    IDEIFState *ide = drivenum < 2 ? _pc_for_cdrom->ide : _pc_for_cdrom->ide2;
+    int ide_drive;
+    switch (drivenum) {
+        case 0: ide_drive = 0; break;
+        case 1: ide_drive = 1; break;
+        case 2: ide_drive = 0; break;
+        case 3: ide_drive = 1; break;
+        default: return;
+    }
+    FIL *f = filename ? ata_get_file(drivenum) : NULL;
+    ide_change_cd(ide, ide_drive, f, was_present);
+}
+
+#ifndef FRANK_PSRAM_BASE
+#define FRANK_PSRAM_BASE 0x11000000u    /* the guest RAM (board_config.h) */
+#endif
+PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
+	   u8 *fb, PCConfig *conf)
+{
+#if TRACE_PORTS
+	f_open(&ports_log, "ports.log", FA_WRITE | FA_CREATE_ALWAYS);
+#endif
+	PC *pc = malloc(sizeof(PC));
+    char *mem = (char *)FRANK_PSRAM_BASE;
+	CPU_CB *cb = NULL;
+	memset(mem, 0, conf->mem_size);
+#ifdef BUILD_ESP32
+	extern char *pcram;
+	extern long pcram_len;
+	pcram = mem + 0xa0000;
+	pcram_len = 0xc0000 - 0xa0000;
+#endif
+#ifdef USEKVM
+	pc->cpu = cpukvm_new(mem, conf->mem_size, &cb);
+#else
+	pc->cpu = cpui386_new(conf->cpu_gen, mem, conf->mem_size, &cb);
+	if (conf->fpu)
+		cpui386_enable_fpu(pc->cpu);
+#endif
+	pc->bios = conf->bios;
+	pc->vga_bios = conf->vga_bios;
+	pc->linuxstart = conf->linuxstart;
+	pc->kernel = conf->kernel;
+	pc->initrd = conf->initrd;
+	pc->cmdline = conf->cmdline;
+	pc->enable_serial = conf->enable_serial;
+#if !defined(_WIN32) && !defined(__wasm__)
+	if (pc->enable_serial)
+		CaptureKeyboardInput();
+#endif
+	pc->full_update = 0;
+
+	pc->pic = i8259_init(raise_irq, pc->cpu);
+	cb->pic = pc->pic;
+	cb->pic_read_irq = read_irq;
+
+	pc->pit = i8254_init(0, pc->pic, set_irq);
+	pc->serial = u8250_init(4, pc->pic, set_irq);
+	pc->cmos = cmos_init(conf->mem_size, 8, pc->pic, set_irq);
+	_pc_cmos_for_floppy = pc->cmos;
+
+	/* Set up INT 13h disk handler (real mode - DOS) */
+	disk_set_cpu(pc->cpu);
+	disk_set_cmos_callback(cmos_floppy_update);
+
+	netredirect_init(pc->cpu, conf->redirector);
+
+	/* Set up IDE emulation (protected mode - Win95) */
+	pc->ide  = ide_allocate(14, pc->pic, set_irq);
+	pc->ide2 = ide_allocate(15, pc->pic, set_irq);
+
+	/* Register CD-ROM callback BEFORE insertdisk so the callback fires
+	 * correctly when insertdisk opens a configured CD image below. */
+	_pc_for_cdrom = pc;
+	disk_set_cdrom_change_callback(cdrom_change_notify);
+
+	/* Attach hard disks and configured CD-ROMs.
+	 * ide_attach_cd MUST come before insertdisk for CD slots: insertdisk
+	 * immediately fires disk_cdrom_change_cb which calls ide_change_cd,
+	 * and that requires drives[n] to already exist. */
+	for (int i = 0; i < 4; i++) {
+		if (!conf->ata[i] || conf->ata[i][0] == 0)
+			continue;
+		if (conf->iscd[i]) {
+			/* Attach ATAPI slot first, then open the image */
+			if (i < 2)
+				ide_attach_cd(pc->ide, i);
+			else
+				ide_attach_cd(pc->ide2, i - 2);
+			insertdisk(i, false, true, conf->ata[i]);
+		} else {
+			/* HDD: insertdisk opens the file, then attach */
+			insertdisk(i, false, false, conf->ata[i]);
+			FIL *fil = ata_get_file(i);
+			if (fil)
+				ide_attach_ata(i < 2 ? pc->ide : pc->ide2,
+				               i < 2 ? i : i - 2,
+				               fil,
+				               ata_get_cyls(i),
+				               ata_get_heads(i),
+				               ata_get_sects(i));
+		}
+	}
+
+	/* CD-ROM E: always present on ide2/drive0 (secondary master).
+	 * Only attach if cdc= didn't already claim that slot (ata[2]). */
+	if (!ide_has_drive(pc->ide2, 0))
+		ide_attach_cd(pc->ide2, 0);
+
+
+
+	ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
+
+	/* we have emulation for 2 FDDs (CMOS 0x10):
+		биты 7-4 = тип A:
+		биты 3-0 = тип B:
+		значение 4 = 1.44MB 3.5"
+	*/
+//	cmos_set(pc->cmos, 0x10, 0x44); // A: = 1.44MB, B: = 1.44MB
+//	cmos_set(pc->cmos, 0x14, 0x41); // бит 0 = флоппи есть, биты 7-6 = 01 = два дисковода
+	/* Checksum ПОСЛЕ всех записей в диапазон 0x10-0x2D */
+//	cmos_update_checksum(pc->cmos);
+
+	int piix3_devfn;
+	pc->i440fx = i440fx_init(&pc->pcibus, &piix3_devfn);
+	pc->pci_ide = piix3_ide_init(pc->pcibus, piix3_devfn + 1);
+
+	pc->phys_mem = mem;
+	pc->phys_mem_size = conf->mem_size;
+    guest_phys_mem = (uint8_t *)pc->phys_mem;
+    guest_phys_mem_size = (unsigned long)pc->phys_mem_size;
+    guest_iomem = pc;
+
+	cb->io = pc;
+	cb->io_read8 = pc_io_read;
+	cb->io_write8 = pc_io_write;
+	cb->io_read16 = pc_io_read16;
+	cb->io_write16 = pc_io_write16;
+	cb->io_read32 = pc_io_read32;
+	cb->io_write32 = pc_io_write32;
+	cb->io_read_string = pc_io_read_string;
+	cb->io_write_string = pc_io_write_string;
+
+	pc->boot_start_time = 0;
+
+	/* gfx_buffer is always 256 KB — always use exactly that, ignoring
+	 * whatever vga_mem the config says.  This ensures Wolf3D's three video
+	 * pages (dword offsets 0 / 16640 / 33280, up to byte 133120) are never
+	 * dropped.  Old SD-card configs with vga_mem=128K would otherwise leave
+	 * the third page zeroed (black) due to the size check in vga_mem_write. */
+	pc->vga_mem_size = 256u << 10;   /* fixed: gfx_buffer is always 256 KB */
+	pc->vga_mem = gfx_buffer;
+	memset(pc->vga_mem, 0, pc->vga_mem_size);
+	pc->vga = vga_init(pc->vga_mem, pc->vga_mem_size,
+			   fb, conf->width, conf->height);
+	vga_set_force_8dm(pc->vga, conf->vga_force_8dm);
+	pc->pci_vga = vga_pci_init(pc->vga, pc->pcibus, pc, set_pci_vga_bar);
+	pc->pci_vga_ram_addr = -1;
+	disk_set_vga(pc->vga);
+
+	/* Attach floppy disks using INT 13h disk handler */
+	const char **fdd = conf->fdd;
+	for (int i = 0; i < 2; i++) {
+		if (!fdd[i] || fdd[i][0] == 0)
+			continue;
+		/* Floppy drives use drivenum 0 and 1 */
+		insertdisk(i, true, false, fdd[i]);
+	}
+
+	cb->iomem = pc;
+	cb->iomem_read8 = iomem_read8;
+	cb->iomem_write8 = iomem_write8;
+	cb->iomem_read16 = iomem_read16;
+	cb->iomem_write16 = iomem_write16;
+	cb->iomem_read32 = iomem_read32;
+	cb->iomem_write32 = iomem_write32;
+	cb->iomem_write_string = iomem_write_string;
+
+	pc->redraw = redraw;
+	pc->redraw_data = redraw_data;
+	pc->poll = poll;
+
+	pc->i8042 = i8042_init(&(pc->kbd), &(pc->mouse),
+			       1, 12, pc->pic, set_irq,
+			       pc, pc_reset_request);
+	i8042_set_cpu(pc->cpu);
+	pc->adlib = adlib_new();
+	/* NE2000 networking removed */
+	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size,
+				0x00, 0x80, 0x480, 0);
+	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size,
+				 0xc0, 0x88, 0x488, 1);
+	/* Emulink FDD – virtual floppy on ports 0xF1F0/0xF1F4 (required by BIOS) */
+	memset(&pc->emulink, 0, sizeof(pc->emulink));
+	pc->emulink.cmd = -1;
+
+	/* FDC (Intel 8272A/82077AA) – port I/O 0x3F0-0x3F7, DMA ch2, IRQ 6.
+	 * Created after isa_dma/pic, and floppy images already inserted above,
+	 * so fdc_media_changed fires correctly on subsequent insert/eject. */
+	pc->fdc = fdc_new(pc->pic, pc->isa_dma);
+	_pc_for_fdc = pc;
+	disk_set_fdc_mediachange_callback(fdc_mediachange_notify);
+	pc->sb16 = sb16_new(0x220, 5,
+			    pc->isa_dma, pc->isa_hdma,
+			    pc->pic, set_irq);
+	pc->pcspk = pcspk_init(pc->pit);
+	sn76489_reset();
+
+	// Audio/mouse enable flags default to enabled
+	// These can be disabled via config_set_* functions at runtime
+	pc->adlib_enabled = 1;
+	pc->sb16_enabled = 1;
+	pc->pcspk_enabled = 1;
+	pc->tandy_enabled = 0;
+	pc->covox_enabled = 1;
+	pc->mpu401_enabled = 1;
+	pc->covox_sample  = 0;
+	pc->dss_enabled = 0;
+	pc->mouse_enabled = 1;
+
+	pc->port92 = 0x2;
+	pc->shutdown_state = 0;
+	pc->reset_request = 0;
+	return pc;
+}
+
+void load_bios_and_reset(PC *pc)
+{
+	int bios_size = 0;
+	if (pc->bios && pc->bios[0])
+		bios_size = load_rom(pc->phys_mem, pc->bios, 0x100000, 1);
+
+	// Only load VGA BIOS if main BIOS doesn't overlap with 0xC0000
+	// 256KB BIOS starts at 0xC0000, so VGA BIOS would overwrite it
+	int bios_start = 0x100000 - bios_size;
+	if (pc->vga_bios && pc->vga_bios[0] && bios_start >= 0xC8000) {
+		load_rom(pc->phys_mem, pc->vga_bios, 0xc0000, 0);
+	} else if (pc->vga_bios && pc->vga_bios[0]) {
+		printf("Skipping VGA BIOS - main BIOS overlaps at 0x%x\n", bios_start);
+	}
+	sn76489_reset();
+
+	// Debug: verify BIOS loaded at reset vector
+	uint8_t *reset_vec = (uint8_t *)pc->phys_mem + 0xFFFF0;
+	printf("Reset vector at 0xFFFF0: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	       reset_vec[0], reset_vec[1], reset_vec[2], reset_vec[3],
+	       reset_vec[4], reset_vec[5], reset_vec[6], reset_vec[7]);
+	printf("phys_mem=%p, reset_vec=%p\n", pc->phys_mem, reset_vec);
+
+#ifndef USEKVM
+	if (pc->kernel && pc->kernel[0]) {
+		int start_addr = 0x10000;
+		int cmdline_addr = 0xf800;
+		int kernel_size = load_rom(pc->phys_mem, pc->kernel, 0x00100000, 0);
+		int initrd_size = 0;
+		if (pc->initrd && pc->initrd[0])
+			initrd_size = load_rom(pc->phys_mem, pc->initrd, 0x00400000, 0);
+		if (pc->cmdline && pc->cmdline[0])
+			strcpy(pc->phys_mem + cmdline_addr, pc->cmdline);
+		else
+			strcpy(pc->phys_mem + cmdline_addr, "");
+
+		load_rom(pc->phys_mem, pc->linuxstart, start_addr, 0);
+		cpui386_reset_pm(pc->cpu, 0x10000);
+		cpui386_set_gpr(pc->cpu, 0, pc->phys_mem_size);
+		cpui386_set_gpr(pc->cpu, 3, initrd_size);
+		cpui386_set_gpr(pc->cpu, 1, cmdline_addr);
+		cpui386_set_gpr(pc->cpu, 2, kernel_size);
+	} else {
+		cpui386_reset(pc->cpu);
+	}
+	// Debug: print CPU state after reset
+	uint32_t cs, ip;
+	int halt;
+	cpui386_get_state(pc->cpu, &cs, &ip, &halt);
+	printf("CPU after reset: CS=%04lx IP=%08lx halt=%d\n",
+	       (unsigned long)cs, (unsigned long)ip, halt);
+#endif
+}
+
+int parse_conf_ini(void* user, const char* section,
+		   const char* name, const char* value)
+{
+	PCConfig *conf = user;
+#define SEC(a) (strcmp(section, a) == 0)
+#define NAME(a) (strcmp(name, a) == 0)
+	// Support both [pc] and [386] sections for compatibility
+	if (SEC("pc") || SEC("386")) {
+		if (NAME("bios")) {
+			conf->bios = strdup(value);
+		} else if (NAME("vga_bios")) {
+			conf->vga_bios = strdup(value);
+		} else if (NAME("mem_size") || NAME("mem")) {
+			/* Obsolete: guest RAM follows physically detected QSPI PSRAM. */
+		} else if (NAME("cpu")) {
+			conf->cpu_gen = atoi(value);
+		} else if (NAME("hda")) {
+			conf->ata[0] = strdup(value);
+			conf->iscd[0] = 0;
+		} else if (NAME("hdb")) {
+			conf->ata[1] = strdup(value);
+			conf->iscd[1] = 0;
+		} else if (NAME("hdc")) {
+			conf->ata[2] = strdup(value);
+			conf->iscd[2] = 0;
+		} else if (NAME("hdd")) {
+			conf->ata[3] = strdup(value);
+			conf->iscd[3] = 0;
+		} else if (NAME("cda")) {
+			conf->ata[0] = strdup(value);
+			conf->iscd[0] = 1;
+		} else if (NAME("cdb")) {
+			conf->ata[1] = strdup(value);
+			conf->iscd[1] = 1;
+		} else if (NAME("cdc")) {
+			conf->ata[2] = strdup(value);
+			conf->iscd[2] = 1;
+		} else if (NAME("cdd")) {
+			conf->ata[3] = strdup(value);
+			conf->iscd[3] = 1;
+		} else if (NAME("fda")) {
+			conf->fdd[0] = strdup(value);
+		} else if (NAME("fdb")) {
+			conf->fdd[1] = strdup(value);
+		} else if (NAME("redirector")) {
+			conf->redirector = atoi(value);
+		} else if (NAME("linuxstart")) {
+			conf->linuxstart = strdup(value);
+		} else if (NAME("kernel")) {
+			conf->kernel = strdup(value);
+		} else if (NAME("initrd")) {
+			conf->initrd = strdup(value);
+		} else if (NAME("cmdline")) {
+			conf->cmdline = strdup(value);
+		} else if (NAME("enable_serial")) {
+			conf->enable_serial = atoi(value);
+		} else if (NAME("vga_force_8dm")) {
+			conf->vga_force_8dm = atoi(value);
+		}
+	} else if (SEC("display")) {
+		if (NAME("width")) {
+			conf->width = atoi(value);
+		} else if (NAME("height")) {
+			conf->height = atoi(value);
+		}
+	} else if (SEC("cpu")) {
+		if (NAME("gen")) {
+			conf->cpu_gen = atoi(value);
+		} else if (NAME("fpu")) {
+			conf->fpu = atoi(value);
+		}
+	}
+#undef SEC
+#undef NAME
+	return 1;
+}
