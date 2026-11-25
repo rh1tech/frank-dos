@@ -255,12 +255,16 @@ SECTIONS
     OVERLAY : NOCROSSREFS {
         .ovl_classic { KEEP(*(.ovl_classic*)) . = ALIGN(4); }
         .ovl_jit { KEEP(*(.ovl_jit*)) . = ALIGN(4); }
+        .ovl_fx16 { KEEP(*(.ovl_fx16*)) . = ALIGN(4); }
     } > RAM AT> FLASH_HI
     PROVIDE(__ovl_vma = ADDR(.ovl_classic));
     PROVIDE(__ovl_classic_lma = LOADADDR(.ovl_classic));
     PROVIDE(__ovl_classic_size = SIZEOF(.ovl_classic));
     PROVIDE(__ovl_jit_lma = LOADADDR(.ovl_jit));
     PROVIDE(__ovl_jit_size = SIZEOF(.ovl_jit));
+    /* frank-dos: the third, fastloop16.inc with a compact cpu_exec1 (jit=2) */
+    PROVIDE(__ovl_fx16_lma = LOADADDR(.ovl_fx16));
+    PROVIDE(__ovl_fx16_size = SIZEOF(.ovl_fx16));
 
     .tbss (NOLOAD) : {
         . = ALIGN(4);

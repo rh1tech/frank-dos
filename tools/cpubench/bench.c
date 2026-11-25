@@ -97,8 +97,17 @@ static void run(CPUI386 *cpu, uint64_t limit)
 {
 	g_exc = -1;
 	uint64_t c0 = cpui386_get_cycle(cpu);
-	while (!cpu->halt && g_exc < 0 && (uint64_t)(cpui386_get_cycle(cpu) - c0) < limit)
-		cpui386_step(cpu, 1 << 14);
+	while (!cpu->halt && g_exc < 0 && (uint64_t)(cpui386_get_cycle(cpu) - c0) < limit) {
+		int sl = getenv("FZSLICE") ? atoi(getenv("FZSLICE")) : 1 << 14;
+		uint64_t cb = cpui386_get_cycle(cpu);
+		uint32_t ipb = cpu->next_ip;
+		cpui386_step(cpu, sl);
+		if (getenv("FZSLICE") && cpui386_get_cycle(cpu) - cb > (uint64_t)sl)
+			printf("overrun: ip %x -> %x, %llu of %d\n", (unsigned)ipb, (unsigned)cpu->next_ip,
+			       (unsigned long long)(cpui386_get_cycle(cpu) - cb), sl);
+		if (getenv("FZCYC"))    /* (where each slice ended) */
+			printf("slice: %llu ip %x\n", (unsigned long long)(cpui386_get_cycle(cpu) - c0), (unsigned)cpu->next_ip);
+	}
 }
 
 /* ---- bench ------------------------------------------------------------- */
@@ -184,7 +193,8 @@ static void modrm(int r, bool a16, bool regonly)
 static void imm(int size) { if (size == 1) b(rnd()); else if (size == 2) d16(rnd()); else d32(rval()); }
 
 static int kmode;        /* fuzzk: what fastloop_m33.S takes (no prefixes, strings, misc) */
-static int rm16;         /* FZMODE 3: real mode, 16-bit code (66h/67h switch to 32 bits) */
+static int rm16;         /* FZMODE 3: real mode, 16-bit code (66h/67h switch to 32 bits);
+                         * 4: the same in 16-bit protected mode (CR0.PE, 64 KB segments) */
 static char jsz[64];     /* each branch field's size: 1, 2 or 4 bytes */
 static int jmode;        /* FZJIT (with FZMODE 3): only what the JIT takes */
 static uint8_t *jfix[64];
@@ -393,6 +403,9 @@ static void fuzz_setup(void)
 
 /* ---- bench16: a 16-bit real-mode image at 2000:0000, to its HLT --------- */
 
+#ifdef FX16_FBSTATS
+unsigned fx16_fb[0x200];
+#endif
 static int bench16(const char *name, const uint8_t *img, unsigned size)
 {
 	memset(mem, 0, 0x100000);
@@ -412,6 +425,20 @@ static int bench16(const char *name, const uint8_t *img, unsigned size)
 	h = fnv(h, mem + 0x30000, 0x10000);
 	printf("%-10s %10ld insns %10lu us  %6.1f ns/insn  state=%08x%s\n", name, n, (unsigned long)(t / 1000),
 	       n ? (double)t / n : 0.0, (unsigned)h, g_exc >= 0 ? "  FAULT" : "");
+#ifdef FX16_FBSTATS
+	{       /* (the fast loop's fall backs, the top ones) */
+		extern unsigned fx16_fb[0x200];
+		for (int k = 0; k < 12; k++) {
+			int m = 0;
+			for (int i = 1; i < 0x200; i++) if (fx16_fb[i] > fx16_fb[m]) m = i;
+			if (!fx16_fb[m]) break;
+			printf("  %s%02x:%u", m & 0x100 ? "66/67 " : "", m & 0xff, fx16_fb[m]);
+			fx16_fb[m] = 0;
+		}
+		printf("\n");
+		memset(fx16_fb, 0, sizeof fx16_fb);
+	}
+#endif
 	cpui386_delete(cpu);
 	return g_exc >= 0;
 }
@@ -431,7 +458,7 @@ static int fuzz(uint64_t seed, unsigned start, unsigned count, int verbose)
 		cpu->cr0 &= ~(1u << 31);
 		cpui386_flush_tlb(cpu);
 	}
-	rm16 = fzmode == 3;
+	rm16 = fzmode == 3 || fzmode == 4;
 #ifdef FZJIT_FIXED
 	jmode = FZJIT_FIXED;
 #else
@@ -439,6 +466,8 @@ static int fuzz(uint64_t seed, unsigned start, unsigned count, int verbose)
 #endif
 	if (rm16) {             /* real mode: CS 2000h, data segments in 30000h..4FFFFh */
 		cpui386_reset(cpu);
+		if (fzmode == 4)
+			cpu->cr0 |= 1;  /* (16-bit protected mode: no paging, CPL 0) */
 		cpui386_flush_tlb(cpu);
 	}
 	uint32_t code_phys = fzmode == 1 ? CODE_LIN : rm16 ? RM_CODE : CODE_PHYS;
@@ -520,13 +549,19 @@ static int fuzz(uint64_t seed, unsigned start, unsigned count, int verbose)
 				cpu->seg[sg].sel = sel[sg];
 				cpu->seg[sg].base = (uint32_t)sel[sg] << 4;
 				cpu->seg[sg].limit = 0xffff;
-				cpu->seg[sg].flags = 0;
+				cpu->seg[sg].flags = fzmode == 4 ? (sg == 1 ? 0x9b : 0x93) : 0;
 			}
 			for (int i = 0; i < 8; i++)
 				cpui386_set_gpr(cpu, i, rn(5) < 3 ? rn(0x10000) : rval());
 			if (rn(3))
 				cpui386_set_gpr(cpu, 4, 0x8000 + (rn(256) & ~1u));
 			cpu->next_ip = org;
+			cpu->sp_mask = 0xffff;
+			if (fzmode == 4 && rn(2)) {     /* (a 32-bit stack, as DOS/4GW's 16-bit code has) */
+				cpu->seg[2].flags |= 1 << 14;   /* (SS.B) */
+				cpu->sp_mask = 0xffffffff;
+				cpui386_set_gpr(cpu, 4, 0x8000 + (rn(256) & ~1u));
+			}
 		}
 		if (fzmode == 2)
 			for (int sg = 0; sg < 4; sg++)
@@ -544,6 +579,8 @@ static int fuzz(uint64_t seed, unsigned start, unsigned count, int verbose)
 		fz_limit = FZLIMIT_FIXED;
 #else
 		if (getenv("FZLIMIT")) fz_limit = atol(getenv("FZLIMIT"));
+		if (getenv("FZLIMITC") && c != (unsigned)atol(getenv("FZLIMITC")))
+			fz_limit = 0;   /* (the limit on that case only, after the others) */
 #endif
 		if (fz_limit) {         /* (bisecting a case: exactly fz_limit instructions) */
 			g_exc = -1;
@@ -576,7 +613,15 @@ static int fuzz(uint64_t seed, unsigned start, unsigned count, int verbose)
 		if (verbose) {
 			printf("%u:", c);
 			for (int i = 0; i < 14; i++) printf(" %08x", (unsigned)st[i]);
-			printf(" mem=%08x code=", fnv(2166136261u, mem + POOL_ADDR, POOL_PAGES * 4096));
+			printf(" mem=%08x", fnv(2166136261u, mem + POOL_ADDR, POOL_PAGES * 4096));
+			if (rm16)       /* (frank-dos: the real-mode data and code, in the hash too) */
+				printf(" rmdata=%08x rmcode=%08x", fnv(2166136261u, mem + RM_DATA, RM_DATA_BYTES),
+				       fnv(2166136261u, mem + RM_CODE, 8192));
+			if (rm16 && getenv("FZDUMP")) {         /* (the real-mode data, for cmp) */
+				FILE *df = fopen(getenv("FZDUMP"), "wb");
+				if (df) fwrite(mem, 1, MEM_SIZE + 65536, df), fclose(df);
+			}
+			printf(" code=");
 			for (uint8_t *p = code; p < end; p++) printf("%02x", *p);
 			printf("\n");
 			fflush(stdout);
@@ -735,6 +780,8 @@ int main(int argc, char **argv)
 		kmode = 1;
 		return fuzz(strtoull(argv[2], NULL, 0), 0, strtoul(argv[3], NULL, 0), argc > 4);
 	}
+	if (argc >= 5 && !strcmp(argv[1], "fuzzfrom"))  /* (SEED START COUNT: a case after others) */
+		return fuzz(strtoull(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0), argc > 5);
 	if (argc >= 4 && !strcmp(argv[1], "fuzzone"))
 		return fuzz(strtoull(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), 1, argc > 4 ? 2 : 1);
 	fprintf(stderr, "usage: %s bench IMAGE... | fuzz SEED COUNT [v]\n", argv[0]);

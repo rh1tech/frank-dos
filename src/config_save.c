@@ -39,7 +39,7 @@ static int cfg_cpu_freq = CPU_CLOCK_MHZ;
 static int cfg_psram_freq = PSRAM_MAX_FREQ_MHZ;
 static int cfg_flash_freq = FLASH_MAX_FREQ_MHZ;
 static int cfg_boot_sd = 0;     /* frank-dos: boot=sd, the card's own FAT is C: (no hard disk image) */
-static int cfg_jit = 1;         /* the real-mode JIT (builds with it; read at boot): on unless jit=0 */
+static int cfg_jit = 2;         /* the CPU core (read at boot): 0 classic, 1 the real-mode JIT, 2 the fast loops */
 static int cfg_volume = 15;
 static int cfg_voltage = -1;  /* -1 = auto (by cpu_freq) */
 static int cfg_mouse_invert_y = 0;
@@ -422,7 +422,9 @@ int parse_frank_386_ini(void* user, const char* section,
     } else if (strcmp(name, "flash_freq") == 0) {
         cfg_flash_freq = atoi(value);
     } else if (strcmp(name, "jit") == 0) {
-        cfg_jit = atoi(value) != 0;
+        cfg_jit = atoi(value);            /* 0 classic, 1 the JIT, 2 the 16-bit fast loop */
+        if (cfg_jit < 0 || cfg_jit > 2)
+            cfg_jit = 1;
     } else if (strcmp(name, "volume") == 0) {
         cfg_volume = atoi(value);
     } else if (strcmp(name, "voltage") == 0) {

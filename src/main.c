@@ -1358,9 +1358,9 @@ static bool init_emulator(void) {
     // Create PC instance
     DBG_PRINT("\nCreating PC instance...\n");
 #if EXEC1_OVERLAY
-    /* the CPU in SRAM: the classic interpreter or the JIT (config.ini jit=) */
+    /* the CPU in SRAM: the classic interpreter, the JIT or the fast loops (frankdos.ini jit=0/1/2) */
     cpui386_select_core(config_get_jit());
-    DBG_PRINT("CPU: %s\n", config_get_jit() ? "real-mode JIT" : "classic interpreter");
+    DBG_PRINT("CPU: %s\n", config_get_jit() == 2 ? "16-bit fast loop" : config_get_jit() ? "real-mode JIT" : "classic interpreter");
 #endif
     /* the disk images are INT 13h's (hle/int13.c), not an emulated controller's;
      * boot=sd (frankdos.ini): no hard disk image, the SD card is C: */
@@ -1523,7 +1523,9 @@ static void console_cmd(char *line) {
     else if (sscanf(line, "jit %d", &(int){0}) == 1) {   /* the jit setting, saved: at the next boot */
         /* into frankdos.ini, its jit= line only: config_save_all() would write
          * a config.ini of its own, without the disks INT 13h took over */
-        int on = atoi(line + 4) != 0;
+        int on = atoi(line + 4);           /* 0 classic, 1 the JIT, 2 the 16-bit fast loop */
+        if (on < 0 || on > 2)
+            on = 1;
         FIL *const fp = &util_fil;
         static char ini[1024] __attribute__((section(".psram_bss"))), out[1100] __attribute__((section(".psram_bss")));
         UINT n = 0;
@@ -1607,6 +1609,68 @@ static void console_cmd(char *line) {
 #else
         printf("ps: not in this build (-DPC_SAMPLE=ON)\n");
 #endif
+    }
+    else if (!strcmp(line, "ophist") || !strcmp(line, "ophist0")) {   /* the opcode histogram (-DEXEC1_OPHIST=1) */
+#if EXEC1_OPHIST
+        extern uint32_t exec1_ophist[2][256];
+        if (line[6]) {
+            memset(exec1_ophist, 0, sizeof exec1_ophist);
+        } else {
+            for (int m = 0; m < 2; m++) {
+                uint64_t total = 0;
+                for (int i = 0; i < 256; i++)
+                    total += exec1_ophist[m][i];
+                printf("ophist %s: %llu\n", m ? "protected" : "real", (unsigned long long)total);
+                for (int i = 0; i < 256; i++)
+                    if (exec1_ophist[m][i])
+                        printf("op %d %02x %lu\n", m, i, (unsigned long)exec1_ophist[m][i]);
+            }
+        }
+#else
+        printf("ophist: not in this build (-DEXEC1_OPHIST=1)\n");
+#endif
+    }
+    else if (!strcmp(line, "fxstats") || !strcmp(line, "fxstats0")) {   /* the fast loop's fallbacks (FX_STATS builds) */
+#ifdef FX_STATS
+        extern unsigned fx_stats[0x400];
+        static long cyc0;
+        if (line[7]) {
+            memset(fx_stats, 0, sizeof fx_stats);
+            cyc0 = pc->cpu->cycle;
+        } else {
+            unsigned long total = 0;
+            for (int i = 0; i < 0x3f0; i++)
+                total += fx_stats[i];
+            printf("fxstats: %lu fallbacks, %u in slices fx_mode refused, of %ld instructions\n", total,
+                   fx_stats[0x3ff], pc->cpu->cycle - cyc0);
+            for (int i = 0; i < 0x400; i++)
+                if (fx_stats[i] * 1000ull > total)   /* (over 0.1% of them) */
+                    printf("fx %03x %u\n", i, fx_stats[i]);
+        }
+#else
+        printf("fxstats: not in this build (-DFX_STATS)\n");
+#endif
+    }
+    else if (!strcmp(line, "membench")) {      /* a read's cost: SRAM, PSRAM in the XIP cache, PSRAM missing it */
+        extern uint8_t gfx_buffer[];        /* (SRAM already: read only) */
+        volatile uint8_t *const areas[3] = { gfx_buffer, (volatile uint8_t *)PSRAM_BASE_ADDR + 0x7A0000u,
+                                             (volatile uint8_t *)PSRAM_BASE_ADDR };
+        static const uint32_t spans[3] = { 4096u, 4096u, 8u << 20 };
+        static const char *const names[3] = { "SRAM", "PSRAM, cached", "PSRAM, random 8 MB" };
+        const uint32_t n = 1u << 20, mhz = clock_get_hz(clk_sys) / 1000000u;
+        for (int k = 0; k < 3; k++) {
+            uint32_t acc = 0, idx = 1;
+            for (uint32_t i = 0; i < 4096u; i++)    /* (warm) */
+                acc += areas[k][i % spans[k]];
+            uint64_t t0 = time_us_64();
+            for (uint32_t i = 0; i < n; i++) {
+                idx = idx * 1664525u + 1013904223u;
+                acc += areas[k][idx & (spans[k] - 1)];
+            }
+            uint64_t us = time_us_64() - t0;
+            printf("membench: %-20s %lu.%02lu cycles a read (loop included) acc %lu\n", names[k],
+                   (unsigned long)(us * mhz / n), (unsigned long)(us * mhz * 100u / n % 100), (unsigned long)acc);
+        }
     }
     else if (!strcmp(line, "cds")) {             /* the kernel's drives */
         extern void fdos_dump_cds(void);

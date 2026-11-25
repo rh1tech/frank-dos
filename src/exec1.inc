@@ -174,11 +174,18 @@ static bool EXEC1_ATTR EXEC1_NAME(CPUI386 *cpu, int stepcount)
 /* 0xf0 */	&&pfxf0, &&f0xf1, &&pfxf2, &&pfxf3, &&f0xf4, &&f0xf5, &&f0xf6, &&f0xf7,
 /* 0xf8 */	&&f0xf8, &&f0xf9, &&f0xfa, &&f0xfb, &&f0xfc, &&f0xfd, &&f0xfe, &&f0xff,
 	};
+#if EXEC1_OPHIST                        /* (the opcode bytes run, prefixes too: ~C ophist~) */
+#define OPHIST_NOTE() (exec1_ophist[cpu->cr0 & 1][b1]++)
+#else
+#define OPHIST_NOTE() ((void)0)
+#endif
+	OPHIST_NOTE();
 	goto *pfxlabel[b1];
 #define HANDLE_PREFIX(C, STMT) \
 		pfx ## C: { \
 			STMT; \
 			TRY(fetch8(cpu, &b1)); \
+			OPHIST_NOTE(); \
 			goto *pfxlabel[b1]; \
 		}
 		HANDLE_PREFIX(26, curr_seg = SEG_ES)

@@ -12,7 +12,8 @@
 # FZMODE (fuzz): 0 flat 32-bit with paging, 1 paging off, 2 DS/ES/SS on one base
 # other than 0, 3 real mode (16-bit code, segments sel << 4).
 # The reference core is src/ as committed at $CPUBENCH_REF (default HEAD), so
-# a working-tree change is always checked against it.
+# a working-tree change is always checked against it (CPUBENCH_REF=worktree:
+# the working tree itself, for a CUR_FLAGS option).
 set -e
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
@@ -22,10 +23,19 @@ FZMODE=${FZMODE:-0}
 export FZMODE
 mkdir -p "$OUT/guest" "$OUT/ref"
 CFLAGS_CORE="${CFLAGS_CORE:--O2 -w}"
-CORE_FILES="i386.c i386.h fpu.c fpu.h fastloop.inc fastloop_m33.S i386ins.def simd.inc remote_mem.h codeprofile.h bbprofile.h cpu_port.h exec1.inc exec1_cold.h jit16.inc jit16.h"
+CORE_FILES="i386.c i386.h fpu.c fpu.h fastloop.inc fastloop16.inc fastloop_m33.S i386ins.def simd.inc remote_mem.h codeprofile.h bbprofile.h cpu_port.h exec1.inc exec1_cold.h jit16.inc jit16.h"
 
-# the reference core, from git
-REFSHA=$(git rev-parse "$REF")
+# the reference core, from git; CPUBENCH_REF=worktree: src/ as it is, so a
+# build option (CUR_FLAGS) is checked against the same tree without it
+if [ "$REF" = worktree ]; then
+	rm -rf "$OUT/ref/src" "$OUT/ref/.sha"
+	mkdir -p "$OUT/ref/src"
+	for f in $CORE_FILES; do [ -f "src/$f" ] && cp "src/$f" "$OUT/ref/src/$f"; done
+	REFSHA=worktree
+	echo worktree > "$OUT/ref/.sha"
+else
+	REFSHA=$(git rev-parse "$REF")
+fi
 if [ ! -f "$OUT/ref/.sha" ] || [ "$(cat "$OUT/ref/.sha")" != "$REFSHA" ]; then
 	rm -rf "$OUT/ref/src"
 	mkdir -p "$OUT/ref/src"
@@ -78,7 +88,7 @@ host() {    # host NAME SRCDIR [CFLAGS...]
 case "${1:-bench}" in
 bench)
 	guests
-	host cur src
+	host cur src $CUR_FLAGS
 	host ref "$OUT/ref/src"
 	for i in 1 2 3; do
 		echo "== ref"; "$OUT/x-ref" bench "$OUT"/guest/*.bin
@@ -112,7 +122,7 @@ case)
 	;;
 bench16)
 	guests16
-	host cur src
+	host cur src $CUR_FLAGS
 	host ref "$OUT/ref/src"
 	echo "== ref"; "$OUT/x-ref" bench16 "$OUT"/guest16/*.bin
 	echo "== cur"; "$OUT/x-cur" bench16 "$OUT"/guest16/*.bin

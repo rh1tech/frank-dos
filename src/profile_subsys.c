@@ -79,6 +79,9 @@ void prof_mem_bench(void) {
     const uint32_t psram_rnd = bench_random(psram, 8u * 1024u * 1024u, &acc);
     const uint32_t psram_seq = bench_sequential(psram, 8u * 1024u * 1024u, &acc);
     const uint32_t sram_rnd  = bench_random(sram_buf, sizeof(sram_buf), &acc);
+    /* frank-dos: a PSRAM read the XIP cache holds (4 KB, warmed by the first pass) */
+    (void)bench_random(psram, 4096u, &acc);
+    const uint32_t psram_hit = bench_random(psram, 4096u, &acc);
 
     printf("\n--- memory latency (%lu MHz, %u iters, acc=%lu) ---\n",
            (unsigned long)mhz, (unsigned)BENCH_ITERS, (unsigned long)acc);
@@ -90,6 +93,8 @@ void prof_mem_bench(void) {
            (unsigned long)((psram_seq / BENCH_ITERS) * 1000u / (mhz ? mhz : 1)));
     printf("  SRAM  random  %4lu cyc/access\n",
            (unsigned long)(sram_rnd / BENCH_ITERS));
+    printf("  PSRAM cached  %4lu cyc/access  (a hit in the XIP cache)\n",
+           (unsigned long)(psram_hit / BENCH_ITERS));
 
     g_bench[0] = psram_rnd / BENCH_ITERS;
     g_bench[1] = psram_seq / BENCH_ITERS;

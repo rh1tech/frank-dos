@@ -30,10 +30,20 @@
  * with it and 27759 with cpu_exec1 (in SRAM) alone, on FRANK Next. Its XIP
  * misses share the QSPI bus with the PSRAM the guest's memory is in. So it
  * runs only where it is in SRAM (CPU_EXEC1_SRAM=OFF). */
-#ifndef FX_ENABLE
-#define FX_ENABLE FX_SRAM
+#ifndef FX16_ENABLE
+#define FX16_ENABLE 0           /* frank-dos: fastloop16.inc, the fast loop for 16-bit code */
 #endif
-#if FX_SRAM
+/* frank-dos: NX's SRAM overlay, its third variant (jit=2, i386.c): this
+ * loop (no kernel) and fastloop16.inc with a compact cpu_exec1, all in
+ * SRAM; run only while that variant is loaded (FX16_ON) */
+#define FX_OVL (EXEC1_OVERLAY && FX16_ENABLE)
+#ifndef FX_ENABLE
+#define FX_ENABLE (FX_SRAM || FX_OVL)
+#endif
+#if FX_OVL
+#define IRAM_ATTR_FX __attribute__((section(".ovl_fx16.fx"), noinline))
+#define FX_TAB_ATTR __attribute__((section(".ovl_fx16.fx_tab")))
+#elif FX_SRAM
 #define IRAM_ATTR_FX __not_in_flash()
 #define FX_TAB_ATTR __not_in_flash("fx_tab")
 #else
@@ -392,6 +402,11 @@ _Static_assert(offsetof(struct fx_state, stepcount) == 16, "fastloop_m33.S: ST_"
 } while (0)
 #endif
 
+#if FX16_ENABLE
+static bool fast_exec16(CPUI386 *cpu, int stepcount);  /* fastloop16.inc: 16-bit code */
+static inline bool fx16_mode(CPUI386 *cpu);
+#endif
+
 static bool IRAM_ATTR_FX fast_exec(CPUI386 *cpu, int stepcount)
 {
 #define A(OP) &&op_alu_ ## OP ## _0, &&op_alu_ ## OP ## _1, &&op_alu_ ## OP ## _2, &&op_alu_ ## OP ## _3, \
@@ -464,8 +479,29 @@ static bool IRAM_ATTR_FX fast_exec(CPUI386 *cpu, int stepcount)
 	u8 b;
 
 again:
-	if (!FX_ENABLE || !fx_mode(cpu))
+	if (!FX_ENABLE || !fx_mode(cpu)) {
+#ifdef FX_STATS
+		extern unsigned fx_stats[0x400];
+		fx_stats[0x3ff] += stepcount;   /* (a slice not for it: fx_mode) */
+		/* which condition (3F0h+): code16, sp_mask, real mode, VM, a limit 0, ES or SS off DS */
+		fx_stats[cpu->code16 ? ((cpu->cr0 & 1) ? 0x3f7 : 0x3f0) : cpu->sp_mask != 0xffffffff ? 0x3f1 : !(cpu->cr0 & 1) ? 0x3f2 :
+			 (cpu->flags & VM) ? 0x3f3 :
+			 !(cpu->seg[SEG_DS].limit && cpu->seg[SEG_ES].limit && cpu->seg[SEG_SS].limit) ? 0x3f4 :
+			 cpu->seg[SEG_ES].base != cpu->seg[SEG_DS].base ? 0x3f5 : 0x3f6] += stepcount;
+#endif
+#if FX16_ENABLE
+#ifdef FX_STATS
+		/* (3E0h: slices fastloop16.inc takes; 3E1h-3E4h refused in protected
+		 * mode: a 32-bit stack, VM, TF, a null DS/ES/SS) */
+		if (cpu->code16 && (cpu->cr0 & 1))
+			fx_stats[FX16_ON && fx16_mode(cpu) ? 0x3e0 : cpu->sp_mask != 0xffff ? 0x3e1 :
+				 (cpu->flags & VM) ? 0x3e2 : (cpu->flags & TF) ? 0x3e3 : 0x3e4] += stepcount;
+#endif
+		if (FX16_ON && fx16_mode(cpu))
+			return fast_exec16(cpu, stepcount);
+#endif
 		return EXEC1_CALL(cpu, stepcount);
+	}
 	pc = cpu->next_ip;
 	csb = cpu->seg[SEG_CS].base;
 	dbase = cpu->seg[SEG_DS].base;
@@ -1166,8 +1202,10 @@ op_0f: {
 		cpu->ip = pc - fb;
 		cpu->next_ip = cpu->ip + 2;
 		cpu->cycle += steps0 - stepcount;
-		if (!cpu->hle_trap(cpu))
+		if (!cpu->hle_trap(cpu)) {
+			cpu->stop = true;       /* (frank-dos: as i386.c's UD0, a native->guest call returned) */
 			return true;
+		}
 		goto again;
 	}
 	if (b2 >= 0x90 && b2 <= 0x9f) {         /* SETcc Eb */
@@ -1409,9 +1447,16 @@ fallback_here:
 	cpu->next_ip = pc - fb;
 	cpu->cycle += steps0 - stepcount - 1;
 	cpu->stop = false;
-	if (!cpu_exec1(cpu, 1))
-		return false;
-	if (cpu->halt || cpu->stop)
+	{
+		/* (frank-dos: the overlay's cpu_exec1, EXEC1_CALL; it may count
+		 * more than one, MOV SS's shadow taking the next) */
+		long c1 = cpu->cycle;
+		if (!EXEC1_CALL(cpu, 1))
+			return false;
+		stepcount -= (int)(cpu->cycle - c1) - 1;
+	}
+	/* (as cpu_exec1's handlers return: HLT, an interrupt let in) */
+	if (cpu->halt || cpu->stop || (cpu->intr && (cpu->flags & IF)))
 		return true;
 	goto again;
 }

@@ -2542,7 +2542,23 @@ static inline void clear_segs(CPUI386 *cpu)
 		sreg32(rm, 0); \
 	} else THROW0(EX_UD);
 
-uint32_t cpu_stat_pe_switches;          /* (MOV CR0 that changed PE: the console's ~C ps~) */
+uint32_t cpu_stat_pe_switches;
+#ifdef FX_STATS
+/* the fast loop's fallbacks, by opcode (0F xx: 100h+, after 66/F3/F2: 200h+, after 64: 300h+;
+ * 2FFh: not on a code page it could read) and how often fx_mode let it run (console ~C fxstats~) */
+#ifdef FRANK_HOST
+unsigned fx_stats[0x400];
+#else
+unsigned fx_stats[0x400] __attribute__((section(".psram_bss")));
+#endif
+#endif
+#ifndef EXEC1_OPHIST
+#define EXEC1_OPHIST 0
+#endif
+#if EXEC1_OPHIST
+/* [protected mode][first byte]: what cpu_exec1 dispatched (console ~C ophist~) */
+uint32_t exec1_ophist[2][256] __attribute__((section(".psram_bss")));
+#endif          /* (MOV CR0 that changed PE: the console's ~C ps~) */
 #define MOVTC() \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
 	TRY(fetch8(cpu, &modrm)); \
@@ -2938,12 +2954,19 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 #define JIT_NOTE_STR(addr1, count, dir) \
 	jit_note_write((dir) > 0 ? (addr1) : (addr1) + ((count) - 1) * (dir), (count) * ((dir) > 0 ? (dir) : -(dir)))
 
+/* (16-bit addressing: the elements to an offset's wrap, a chunk never past
+ * it; 0 when an element straddles it, for the slow path) */
+#define STR_WRAP16(BIT, off, dir) \
+	((dir) > 0 ? (int)((0x10000u - ((off) & 0xffff)) / (BIT / 8)) \
+	           : (int)(((off) & 0xffff) / (BIT / 8) + 1))
+
 #define STOS_helper2(BIT, ABIT) \
 	OptAddr memld; \
 	uword cx = lreg ## ABIT(1); \
 	while (cx) { \
 		TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, lreg ## ABIT(7))); \
-		if (memld.addr1 % (BIT / 8)) { \
+		if (memld.addr1 % (BIT / 8) || \
+		    (ABIT == 16 && !STR_WRAP16(BIT, lreg ## ABIT(7), dir))) { \
 			/* slow path */ \
 			while (lreg ## ABIT(1)) { \
 				stdi(BIT, ABIT) \
@@ -2957,6 +2980,8 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		else countd = 1 + (memld.addr1 & 4095) / (BIT / 8); \
 		if (countd < count) \
 			count = countd; \
+		if (ABIT == 16 && STR_WRAP16(BIT, lreg ## ABIT(7), dir) < (int)count) \
+			count = STR_WRAP16(BIT, lreg ## ABIT(7), dir); \
 		JIT_NOTE_STR(memld.addr1, count, dir); \
 		for (uword i = 0; i <= count - 1; i++) { \
 			saddr ## BIT(&memld, ax); \
@@ -3046,7 +3071,9 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 	while (cx) { \
 		TRY(translate ## BIT(cpu, &memls, 1, curr_seg, lreg ## ABIT(6))); \
 		TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, lreg ## ABIT(7))); \
-		if (memls.addr1 % (BIT / 8) || memld.addr1 % (BIT / 8)) { \
+		if (memls.addr1 % (BIT / 8) || memld.addr1 % (BIT / 8) || \
+		    (ABIT == 16 && (!STR_WRAP16(BIT, lreg ## ABIT(6), dir) || \
+		                    !STR_WRAP16(BIT, lreg ## ABIT(7), dir)))) { \
 			/* slow path */ \
 			while (lreg ## ABIT(1)) { \
 				ldsistdi(BIT, ABIT) \
@@ -3067,6 +3094,12 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 			count = counts; \
 		if (countd < count) \
 			count = countd; \
+		if (ABIT == 16) { \
+			if (STR_WRAP16(BIT, lreg ## ABIT(6), dir) < (int)count) \
+				count = STR_WRAP16(BIT, lreg ## ABIT(6), dir); \
+			if (STR_WRAP16(BIT, lreg ## ABIT(7), dir) < (int)count) \
+				count = STR_WRAP16(BIT, lreg ## ABIT(7), dir); \
+		} \
 		if (cpu->cb.iomem_write_string && in_iomem(memld.addr1) && \
 		    dir > 0  && in_iomem(memld.addr1 + count - 1) && \
 		    (memls.addr1 | 4095) < cpu->phys_mem_size && \
@@ -3164,7 +3197,8 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 	uword cx = lreg ## ABIT(1); \
 	while (cx) { \
 		TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, lreg ## ABIT(7))); \
-		if (memld.addr1 % (BIT / 8)) { \
+		if (memld.addr1 % (BIT / 8) || \
+		    (ABIT == 16 && !STR_WRAP16(BIT, lreg ## ABIT(7), dir))) { \
 			/* slow path */ \
 			while (lreg ## ABIT(1)) { \
 				indxstdi(BIT, ABIT) \
@@ -3178,6 +3212,8 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		else countd = 1 + (memld.addr1 & 4095) / (BIT / 8); \
 		if (countd < count) \
 			count = countd; \
+		if (ABIT == 16 && STR_WRAP16(BIT, lreg ## ABIT(7), dir) < (int)count) \
+			count = STR_WRAP16(BIT, lreg ## ABIT(7), dir); \
 		if (cpu->cb.io_read_string && dir > 0 && \
 		    (memld.addr1 | 4095) < cpu->phys_mem_size && \
 		    !in_iomem(memld.addr1) && !in_iomem(memld.addr1 | 4095)) { \
@@ -3228,7 +3264,8 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 	uword cx = lreg ## ABIT(1); \
 	while (cx) { \
 		TRY(translate ## BIT(cpu, &memls, 1, curr_seg, lreg ## ABIT(6))); \
-		if (memls.addr1 % (BIT / 8)) { \
+		if (memls.addr1 % (BIT / 8) || \
+		    (ABIT == 16 && !STR_WRAP16(BIT, lreg ## ABIT(6), dir))) { \
 			/* slow path */ \
 			while (lreg ## ABIT(1)) { \
 				ldsioutdx(BIT, ABIT) \
@@ -3242,6 +3279,8 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		else counts = 1 + (memls.addr1 & 4095) / (BIT / 8); \
 		if (counts < count) \
 			count = counts; \
+		if (ABIT == 16 && STR_WRAP16(BIT, lreg ## ABIT(6), dir) < (int)count) \
+			count = STR_WRAP16(BIT, lreg ## ABIT(6), dir); \
 		if (cpu->cb.io_write_string && dir > 0 && \
 		    (memls.addr1 | 4095) < cpu->phys_mem_size && \
 		    !in_iomem(memls.addr1) && !in_iomem(memls.addr1 | 4095)) { \
@@ -4232,6 +4271,9 @@ static bool verbose;
 #ifndef EXEC1_OVERLAY
 #define EXEC1_OVERLAY 0
 #endif
+#ifndef FX16_ENABLE
+#define FX16_ENABLE 0           /* frank-dos: fastloop16.inc (with the overlay: its third variant) */
+#endif
 #if EXEC1_OVERLAY
 #define EXEC1_JIT_FUNC(name) __attribute__((section(".ovl_jit." #name), noinline))
 #define EXEC1_JIT_DATA(name) __attribute__((section(".ovl_jit." #name)))
@@ -4247,7 +4289,12 @@ static bool verbose;
  * ACOP_helper set them (the flash copy keeps those expansions). Out of line:
  * the group's 8 operations x 3 widths x register/memory had been ~17 KB of
  * cpu_exec1. The result, sign-extended. */
+#if EXEC1_OVERLAY && FX16_ENABLE
+/* (both compact variants call it: SRAM outside the overlay) */
+static uword __not_in_flash("alu_grp1") alu_grp1(CPUI386 *cpu, int op, uword x, uword y, int bits)
+#else
 static uword EXEC1_JIT_FUNC(alu_grp1) alu_grp1(CPUI386 *cpu, int op, uword x, uword y, int bits)
+#endif
 {
 	sword a = bits == 8 ? (s8)x : bits == 16 ? (s16)x : (s32)x;
 	sword c = bits == 8 ? (s8)y : bits == 16 ? (s16)y : (s32)y;
@@ -4342,25 +4389,61 @@ logic:
 #undef EXEC1_TAB_ATTR
 #undef EXEC1_COLD_GUARD
 
+#if FX16_ENABLE
+/* frank-dos, the third variant: fastloop.inc's and fastloop16.inc's loops
+ * with a compact cpu_exec1 (no JIT) for what they fall back on, cold
+ * opcodes in flash */
+#define EXEC1_COLD_GUARD(op) if (EXEC1_IS_COLD(op)) goto exec1_cold;
+#define EXEC1_HOT 1
+#define EXEC1_JIT 0
+#define EXEC1_COMPACT 1
+#define EXEC1_NAME cpu_exec1_fx16
+#define EXEC1_ATTR __attribute__((section(".ovl_fx16.cpu_exec1"), noinline, optimize(CPU_EXEC1_OPT)))
+#define EXEC1_TAB_ATTR __attribute__((section(".ovl_fx16.pfxlabel")))
+#include "exec1.inc"
+#undef EXEC1_HOT
+#undef EXEC1_JIT
+#undef EXEC1_COMPACT
+#undef EXEC1_NAME
+#undef EXEC1_ATTR
+#undef EXEC1_TAB_ATTR
+#undef EXEC1_COLD_GUARD
+extern char __ovl_fx16_lma[], __ovl_fx16_size[];
+#endif
+static bool fx16_on;            /* (fastloop.inc: fast_exec16 is in SRAM) */
+
 static bool (*exec1_fn)(CPUI386 *, int) = cpu_exec1_classic;
 
 extern char __ovl_vma[], __ovl_classic_lma[], __ovl_classic_size[], __ovl_jit_lma[], __ovl_jit_size[];
 
 /* the variant SRAM runs, before the CPU does (the jit setting, main.c) */
-/* mode: 0 the classic interpreter, 1 the compact one with the JIT */
+/* mode: 0 the classic interpreter, 1 the compact one with the JIT,
+ * 2 the 16-bit fast loop (FX16_ENABLE builds; else the classic one) */
 void cpui386_select_core(int mode)
 {
-	bool jit = mode != 0;
+#if FX16_ENABLE
+	if (mode == 2) {
+		memcpy(__ovl_vma, __ovl_fx16_lma, (size_t)__ovl_fx16_size);
+		__asm volatile ("dsb\n\tisb" ::: "memory");
+		exec1_fn = cpu_exec1_fx16;
+		fx16_on = true;
+		return;
+	}
+#endif
+	bool jit = mode == 1;
 	if (jit)
 		memcpy(__ovl_vma, __ovl_jit_lma, (size_t)__ovl_jit_size);
 	else
 		memcpy(__ovl_vma, __ovl_classic_lma, (size_t)__ovl_classic_size);
 	__asm volatile ("dsb\n\tisb" ::: "memory");
 	exec1_fn = jit ? cpu_exec1 : cpu_exec1_classic;
+	fx16_on = false;
 }
+#define FX16_ON fx16_on
 #define EXEC1_CALL(cpu, n) exec1_fn(cpu, n)
 #else
 #define EXEC1_CALL(cpu, n) cpu_exec1(cpu, n)
+#define FX16_ON 1
 #endif
 
 // XXX: incomplete
@@ -5221,6 +5304,7 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 #include "jit16.inc"
 #endif
 #include "fastloop.inc"
+#include "fastloop16.inc"
 
 void cpui386_step(CPUI386 *cpu, int stepcount)
 {
@@ -5242,7 +5326,8 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		return;
 	}
 
-	if (!fast_exec(cpu, stepcount)) {
+	/* (fast_exec: in SRAM only with the overlay's fx16 variant, FX16_ON) */
+	if (!(FX16_ON ? fast_exec(cpu, stepcount) : EXEC1_CALL(cpu, stepcount))) {
 		/* frank-react: Win32 user mode has no IDT; faults go to the HLE
 		 * exception dispatcher (SEH), which sets up next_ip itself. */
 		if (cpu->exc_hook) {

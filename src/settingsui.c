@@ -303,7 +303,8 @@ static void cycle_option(int direction) {
 
         case SETTING_JIT:
 #if EXEC1_OVERLAY
-            config_set_jit(!config_get_jit());
+            /* 0 classic, 1 the JIT, 2 the fast loops (FX16 builds) */
+            config_set_jit((config_get_jit() + direction + 3) % 3);
 #endif
             break;
 
@@ -437,7 +438,7 @@ static void draw_settings_menu(void) {
         "Volume:",
         "CPU Type:",
         "FPU (387):",
-        "Real-mode JIT:",
+        "CPU core:",
         "SD cart as H drive:",
         "PC Speaker:",
         "AdLib:",
@@ -484,9 +485,10 @@ static void draw_settings_menu(void) {
                 break;
             case SETTING_JIT:
 #if EXEC1_OVERLAY
-                /* (the classic interpreter keeps protected mode's speed;
-                 * the JIT speeds real-mode code; at the next boot) */
-                snprintf(value, sizeof(value), "< %s >", config_get_jit() ? "Enabled" : "Disabled");
+                /* (the CPU's SRAM overlay, at the next boot: the classic
+                 * interpreter, the real-mode JIT, or the fast loops) */
+                snprintf(value, sizeof(value), "< %s >", config_get_jit() == 2 ? "Fast loop" :
+                         config_get_jit() ? "JIT" : "Classic");
 #else
                 snprintf(value, sizeof(value), "  n/a");
 #endif

@@ -15,6 +15,9 @@ FRANK Next master, 504 MHz, PSRAM 133 MHz, flash 84 MHz, HDMI. Run with `tools/b
 | 2026-11-24 | phase 2, native FreeDOS, jit=1 (frank-386 JIT) | 3.483 | | | the JIT thrashes: 3000 blocks/s compiled |
 | 2026-11-24 | + adaptive threshold | 3.789 | | | compiles 16/s; the compact interpreter is the cost |
 | 2026-11-24 | + 2048-entry table, 48 KB cache | 3.969 | | | still below the classic interpreter |
+| 2026-11-24 | native FreeDOS, jit=0, mixer on core 1 | 5.017 | | | |
+| 2026-11-25 | **jit=2, the 16-bit fast loop** (fastloop16.inc) | **9.753** | | | 1205 gametics in 4324 realtics: ×1.94 |
+| 2026-11-25 | jit=2 with fastloop.inc's 32-bit loop in the same overlay | **10.140** | | | 4159 realtics |
 
 Notes:
 - `--no-jit` builds put the interpreter in a slower layout (4.412 fps, 4361, 1518.3K): compare with `jit=0` at run time, not with `--no-jit`.
@@ -87,3 +90,61 @@ Tried as jit=2: the JIT variant's compact interpreter, with the JIT's 60 KB of t
 
 - **A native DPMI host would save at most the real-mode share:** DOS/4GW's DOS and BIOS calls and their mode switches are 2.3% of the time. Not built.
 - **The fast loop loses here:** with cpu_exec1 in flash, 76% of the samples are in flash, because the fast loop falls back to cpu_exec1 for much of Doom's code. The classic interpreter in SRAM stays.
+
+### What an x86 instruction costs (2026-11-25, Doom 286 mid-demo, 504 MHz)
+
+Measured with `~C ps0~`, then `~C ps~` a second later (PC_SAMPLE builds: guest instructions over the window, the XIP cache's own counters), and `~C membench~`.
+
+| | |
+|---|---|
+| guest instructions | 3.29 M a second, **153 cycles each** |
+| XIP cache | 22 M accesses a second (6.7 per instruction), 98.8% hits, ~250 k misses a second |
+| a read: SRAM / PSRAM cached / PSRAM missing the cache | 8 / 8 / 155 cycles (loop included) |
+| cpu_exec1 built -O2 instead of -Os (+26 KB of SRAM; tried with a 224 KB VGA buffer) | 150 cycles each: 2% |
+
+- **Memory:** cache misses cost about 7% of the CPU. A cache hit costs nothing over SRAM.
+- **The rest is the interpreter's own instructions:** the loop head (about 45 ARM instructions with its spills), modsib_f and translate_fast calls, OptAddr round trips, lazy flags. Compiler settings don't change that much, and neither will trimming spills. Only a leaner decode for the common real-mode instructions would: a fast loop as frank-react has for flat 32-bit code.
+
+### Opcode coverage, and the fast loop on DOS/4GW Doom (2026-11-25)
+
+Opcode histograms (`-DEXEC1_OPHIST=ON`, `~C ophist0~` / `~C ophist~`, 60 s of each timedemo):
+
+| | opcode values for 90% / 95% / 99% / 99.9% of the bytes run | top |
+|---|---|---|
+| Doom 286 (real mode) | 54 / 69 / 97 / 131 | MOV Ev,Gv 15%, MOV Gv,Ev 12%, ES: 6%, ADD 4%, MOV Sw,Ew 3% |
+| DOS/4GW Doom 1.9 (32-bit) | 33 / 47 / 78 / 118 | MOV Gb,Eb 13%, GRP1 Ev,Iv 10%, 0F xx 9%, MOV Gv,Ev 9% |
+
+frank-react's fast loop in the frank-react layout (`-DCPU_EXEC1_SRAM=OFF -DCPU_JIT16=OFF`, `-DFX_STATS=1`, `~C fxstats~`), 30 s of DOS/4GW Doom, 48.4 M instructions:
+- **Its table takes 99% of the opcodes, but it runs only 54% of the instructions.**
+- **37% are in 16-bit protected-mode code,** which fx_mode() refuses (code16). None of it is real mode.
+- **8.7% fall back to cpu_exec1:** SHLD (0F A4) 2.4 M (Doom's fixed-point multiply), `66 89` 0.76 M, `88` 0.68 M (byte stores, likely to VGA memory), `66 0F` 0.18 M, SHRD 0.06 M, OUT/IN, PUSHA/POPA.
+- **Consequence:** a fast loop for 16-bit code (segment bases, 16-bit operands and addressing) would cover real-mode games and this 37% of DOS/4GW Doom at once. SHLD/SHRD and a VGA store path would close most of the rest.
+
+The frank-react layout is fragile on the board: `~C RST~` and some flashes leave it without a console or HDMI until it is flashed again.
+
+### The 16-bit fast loop (2026-11-25)
+
+DOS/4GW Doom 1.9 (`doom386 -timedemo demo1`, 1710 gametics): classic interpreter 17,556 realtics, **jit=2 13,388 realtics (×1.31)**. jit=2 is now the default (`cfg_jit`), and the settings menu's "CPU core" item cycles Classic / JIT / Fast loop.
+
+`src/fastloop16.inc`: frank-react's fast-loop design for real-mode 16-bit code: direct-threaded dispatch, operands through the TLB tags (FX_MEM), lazy flags as i386.c keeps them. Whatever it lacks falls back to cpu_exec1 one instruction at a time. When fallbacks come back to back (code under 66h/67h), the classic core takes up to 32 instructions at once. On NX it is the SRAM overlay's third variant (`jit=2` in frankdos.ini, `~C jit 2~`): this loop (36 KB), fastloop.inc's 32-bit C loop (33 KB, without the Thumb-2 kernel, which doesn't fit) and a compact cpu_exec1 without the JIT (62 KB), cold opcodes in flash; 139,376 bytes, within the overlay's size. It also runs 16-bit protected-mode code (segment loads, far transfers, CLI and POPF fall back there) on a 16- or 32-bit stack; checked by `FZMODE=4` (16-bit protected mode, SS.B in half the cases).
+
+Checked with `CPUBENCH_REF=worktree FZMODE=3 CUR_FLAGS=-DFX16_ENABLE=1 tools/cpubench/run.sh fuzz 20000 "1 2 3 4 5 6 7 8"`: 0 of 160,000 cases differ from cpu_exec1. The fuzzing turned up three bugs, now fixed:
+- **cpu_exec1's REP MOVS/STOS/INS/OUTS ignored the 16-bit SI/DI wrap.** They chunked by page only, so a STOSW at DI=FFF0h kept going linearly past ES:FFFF. The chunks now also stop at the offset's wrap (STR_WRAP16).
+- **Budget.** The fast loop checked its step budget only at jumps; it now checks it on every instruction, as fastloop.inc does. A fallback also charges what cpu_exec1 actually counted: MOV SS/POP SS takes the next instruction with it.
+- **The HLE trap (0F FF) and the nested native→guest calls.** A trap that returns false now sets cpu->stop, as i386.c's UD0 does; without it the board hung at "Press F8". fastloop.inc had the same gap. Fallbacks and traps also return when an interrupt is let in.
+
+qemu M33 (`ARM_FLAGS=-DFX16_ENABLE=1 tools/cpubench/run.sh arm16`, M33 instructions per x86 instruction):
+
+| guest | cpu_exec1 | fast loop |
+|---|---|---|
+| rmloop | 80.6 | 39.0 |
+| jcctest | 68.9 | 36.0 |
+| smctest | 97.6 | 39.4 |
+| fartest | 120.6 | 72.6 |
+| dhry (gcc -m16: all 66h/67h) | 104.1 | 113.6 |
+| whet (66h/67h, x87) | 220.1 | 232.2 |
+
+What still falls back (`CUR_FLAGS="-DFX16_ENABLE=1 -DFX16_FBSTATS" run.sh bench16`): 66h/67h code, INT/IRET, POP Ev (8F), x87. 16-bit protected-mode code (DOS/4GW's 37%) is not covered yet.
+
+**Correction (2026-11-25):** the "16-bit protected mode" share of DOS/4GW Doom (37% above, 21% in a later count) is an artifact. FX_STATS assigns a whole 4096-instruction slice to the mode it starts in, and interrupts are taken at slice start: Doom's 140 Hz timer starts about 147 slices a second in DOS/4GW's 16-bit IRQ handler, which goes back to 32-bit code within a few instructions. Running that code in fastloop16.inc changed nothing (18,245 vs 18,260 realtics). The time is in flat 32-bit code, so fastloop.inc's loop in SRAM is what gained.
+

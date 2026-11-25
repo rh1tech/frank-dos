@@ -28,8 +28,11 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "hardware/clocks.h"
 #include "hardware/structs/systick.h"
 #include "i386.h"
+#include "hardware/regs/addressmap.h"
+#include "hardware/regs/xip.h"
 
 /* Histogram over the RAM-resident text region. cpu_exec1 lives at
  * ~0x20002c5c and runs 119 KB; 0x20000000..0x20040000 at 64-byte
@@ -108,7 +111,25 @@ void ps_init(uint32_t sys_hz, uint32_t sample_hz) {
 
 void ps_stop(void) { systick_hw->csr = 0; }
 
+/* the XIP cache's own counters (every cached flash and PSRAM access, and
+ * the hits among them; written to clear) */
+#define XIP_CTR_HIT (*(volatile uint32_t *)(XIP_CTRL_BASE + XIP_CTR_HIT_OFFSET))
+#define XIP_CTR_ACC (*(volatile uint32_t *)(XIP_CTRL_BASE + XIP_CTR_ACC_OFFSET))
+
+static uint64_t ps_cycle0, ps_us0;          /* the guest's instructions, the time, at ps_clear */
+
+static uint64_t ps_guest_insns(void) {
+    if (!hle_pc)
+        return 0;
+    const CPUI386 *cpu = *(CPUI386 *const *)hle_pc;
+    return cpu->cycle;
+}
+
 void ps_clear(void) {
+    XIP_CTR_HIT = 0;
+    XIP_CTR_ACC = 0;
+    ps_cycle0 = ps_guest_insns();
+    ps_us0 = time_us_64();
     extern uint32_t cpu_stat_pe_switches;
     cpu_stat_pe_switches = 0;
     ps_real = ps_v86 = 0;
@@ -129,6 +150,19 @@ void ps_report(int top) {
         flash += ps_fhist[i];
     printf("ps: total %lu sram %lu flash %lu other %lu\n", (unsigned long)total,
            (unsigned long)(total - flash - ps_outside), (unsigned long)flash, (unsigned long)ps_outside);
+    {
+        uint32_t acc = XIP_CTR_ACC, hit = XIP_CTR_HIT;
+        printf("ps: XIP cache accesses %lu hits %lu (%lu.%lu%%), misses %lu\n", (unsigned long)acc,
+               (unsigned long)hit, (unsigned long)(acc ? (uint64_t)hit * 100u / acc : 0),
+               (unsigned long)(acc ? (uint64_t)hit * 1000u / acc % 10 : 0), (unsigned long)(acc - hit));
+    }
+    {
+        uint64_t n = ps_guest_insns() - ps_cycle0, us = time_us_64() - ps_us0;
+        uint32_t mhz = clock_get_hz(clk_sys) / 1000000u;
+        printf("ps: guest instructions %llu in %llu ms: %lu k/s, %lu.%lu cycles each\n",
+               (unsigned long long)n, (unsigned long long)(us / 1000), (unsigned long)(us ? n * 1000u / us : 0),
+               (unsigned long)(n ? us * mhz / n : 0), (unsigned long)(n ? us * mhz * 10u / n % 10 : 0));
+    }
     extern uint32_t cpu_stat_pe_switches;
     printf("ps: guest real mode %lu.%lu%% v86 %lu.%lu%%, PE switches %lu\n",
            (unsigned long)(ps_real * 100u / (total ? total : 1)), (unsigned long)(ps_real * 1000u / (total ? total : 1) % 10),

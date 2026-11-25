@@ -544,6 +544,10 @@ if(NOT AUTOTYPE STREQUAL "")
 endif()
 
 option(PC_SAMPLE "Sample core-0 PC to find interpreter hot spots" OFF)
+option(EXEC1_OPHIST "Count the opcodes cpu_exec1 runs (console ~C ophist~)" OFF)
+if(EXEC1_OPHIST)
+    target_compile_definitions(${BUILD_NAME} PRIVATE EXEC1_OPHIST=1)
+endif()
 
 # Basic-block discovery and reuse profiling. Stage 1 of the JIT.
 # SD block cache in the slave RP2350's PSRAM (C2 only). See src/diskcache.h.
@@ -602,6 +606,11 @@ endif()
 option(CPU_JIT16 "real-mode JIT (src/jit16.inc)" OFF)
 option(CPU_JIT16_STATS "the JIT: its counters on the board (jit_stat_*)" OFF)
 option(CPU_JIT16_PROF "the JIT: count the interpreter's real-mode opcodes (jit_prof_op)" OFF)
+option(CPU_FX16 "NX: the 16-bit fast loop, a third overlay variant (jit=2)" ON)
+option(FX_STATS "the fast loops' fall back counters (~C fxstats~)" OFF)
+if(FX_STATS)
+    target_compile_definitions(${BUILD_NAME} PRIVATE FX_STATS=1)
+endif()
 if(CPU_JIT16 AND CPU_EXEC1_SRAM)
     target_compile_definitions(${BUILD_NAME} PRIVATE JIT16=1)
     if(BOARD STREQUAL "NX")
@@ -610,6 +619,11 @@ if(CPU_JIT16 AND CPU_EXEC1_SRAM)
         # with the JIT and a cache that fills the rest of the same SRAM.
         pico_set_linker_script(${BUILD_NAME} ${CMAKE_CURRENT_LIST_DIR}/boards/memmap_nx_overlay.ld)
         target_compile_definitions(${BUILD_NAME} PRIVATE EXEC1_OVERLAY=1 JIT_CACHE_BYTES=49152)
+        # frank-dos: the overlay's third variant (jit=2), the 16-bit fast
+        # loop (src/fastloop16.inc) with a compact cpu_exec1
+        if(CPU_FX16)
+            target_compile_definitions(${BUILD_NAME} PRIVATE FX16_ENABLE=1)
+        endif()
     endif()
     if(CPU_JIT16_STATS)     # (the per-block-run counters, read over SWD)
         target_compile_definitions(${BUILD_NAME} PRIVATE JIT_STATS=1)
