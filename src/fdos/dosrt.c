@@ -230,6 +230,13 @@ bool dosrt_int(CPU *cpu, uint8_t n)
 	if (fdos_dbg21_left > 0 && n == 0x21 && CPU_AH != 0x2C && CPU_AH != 0x0B) {   /* (not VC's polls) */
 		fdos_dbg21_left--;
 		printf("int21 ax %04x bx %04x cx %04x dx %04x ds %04x es %04x\n", CPU_AX, CPU_BX, CPU_CX, CPU_DX, CPU_DS, CPU_ES);
+		if (CPU_AH == 0x40 && CPU_BX <= 2) {    /* (what goes to the screen: the text, up to 80) */
+			const uint8_t *t = (const uint8_t *)PSRAM_BASE_ADDR + ((uint32_t)CPU_DS << 4) + CPU_DX;
+			printf("  \"");
+			for (unsigned i = 0; i < CPU_CX && i < 80; i++)
+				printf(t[i] >= 32 && t[i] < 127 ? "%c" : "\\x%02x", t[i]);
+			printf("\"\n");
+		}
 	}
 	if (!ctx_push(h, 0)) {
 		cpu->next_ip = (uint16_t)(cpu->ip + 4);

@@ -200,7 +200,8 @@ typedef union {
 static inline uint8_t *guest_span_ptr_ex(uint32_t addr, uint32_t *span, bool write_access)
 {
 	(void)write_access;
-	*span = addr < 0xA0000u ? 0xA0000u - addr : (addr < hle_ram_size ? hle_ram_size - addr : 0);
+	/* (none in the VGA window, A0000-BFFFF: g_rd8/g_wr8 there) */
+	*span = addr < 0xA0000u ? 0xA0000u - addr : (addr >= 0xC0000u && addr < hle_ram_size ? hle_ram_size - addr : 0);
 	return hle_ram + addr;
 }
 static inline uint8_t *guest_span_ptr(uint32_t addr, uint32_t *span) { return guest_span_ptr_ex(addr, span, true); }

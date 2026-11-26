@@ -837,9 +837,10 @@ static void vga_graphic_refresh(VGAState *s,
     if (shift_control == 0 || shift_control == 1) {
         update_palette16(s, palette);
         if (s->sr[0x01] & 8) {
+            /* (the dot clock halved: each of the CRTC's pixels twice;
+             * frank-dos: EGA 320x200, mode 0Dh, as CGA's) */
             xdiv = 2;
-            if (shift_control == 1) // XXX
-                w *= 2;
+            w *= 2;
         }
     } else {
         if (!vbe_enabled(s)) {

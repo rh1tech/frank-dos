@@ -1316,36 +1316,20 @@ static inline size_t seg_room(uint16_t off) { return (size_t)0x10000u - off; }
     proto.h - для путей данных, держащих гостевой линейный курсор напрямую
     (rwblock() в fatfs.c).
 */
+/* frank-dos: through g_read/g_write (hle/hle.c), which take the VGA window
+   A0000-BFFFF byte by byte through the VGA's planes: a file read straight
+   into EGA memory (Dangerous Dave 2's tiles, A320:0000) went to the raw RAM
+   under it before, and the game's data was lost */
 void __not_in_flash_func(guest_lin_write)(uint32_t lin, const void *src, size_t n) {
-    const uint8_t *p = (const uint8_t *)src;
-    while (n) {
-        uint32_t span;
-        uint8_t *h = guest_span_ptr(lin, &span);
-        size_t chunk = (span < n) ? span : n;
-        dos_api_memcpy(h, p, chunk);
-        p += chunk; lin += chunk; n -= chunk;
-    }
+    g_write(lin, src, (uint32_t)n);
 }
 
 void __not_in_flash_func(guest_lin_read)(void *dst, uint32_t lin, size_t n) {
-    uint8_t *p = (uint8_t *)dst;
-    while (n) {
-        uint32_t span;
-        const uint8_t *h = guest_span_ptr(lin, &span);
-        size_t chunk = (span < n) ? span : n;
-        dos_api_memcpy(p, h, chunk);
-        p += chunk; lin += chunk; n -= chunk;
-    }
+    g_read(dst, lin, (uint32_t)n);
 }
 
 static void __not_in_flash_func(guest_lin_set)(uint32_t lin, int v, size_t n) {
-    while (n) {
-        uint32_t span;
-        uint8_t *h = guest_span_ptr(lin, &span);
-        size_t chunk = (span < n) ? span : n;
-        nf_memset(h, v, chunk);
-        lin += chunk; n -= chunk;
-    }
+    guest_fill_block(lin, (uint8_t)v, n);
 }
 
 void __not_in_flash_func(fmemset)(dos_far_ptr p, int v, size_t sz) {
@@ -1378,17 +1362,14 @@ void __not_in_flash_func(fmemcpy)(dos_far_ptr d, const dos_far_ptr s, size_t n) 
         {
             uint32_t dlin = EFFECTIVE(MK_FP(dseg, doff));
             uint32_t slin = EFFECTIVE(MK_FP(sseg, soff));
-            size_t   left = chunk;
-            while (left) {
-                uint32_t dspan, sspan;
-                uint8_t       *dh = guest_span_ptr(dlin, &dspan);
-                const uint8_t *sh = guest_span_ptr(slin, &sspan);
-                size_t m = left;
-                if (m > dspan) m = dspan;
-                if (m > sspan) m = sspan;
-                dos_api_memcpy(dh, sh, m);
-                dlin += m; slin += m; left -= m;
-            }
+            if (!g_is_vga(dlin) && !g_is_vga(dlin + chunk - 1) && dlin + chunk <= hle_ram_size &&
+                !g_is_vga(slin) && !g_is_vga(slin + chunk - 1) && slin + chunk <= hle_ram_size &&
+                !(dlin < 0xA0000u && dlin + chunk > 0xC0000u) && !(slin < 0xA0000u && slin + chunk > 0xC0000u)) {
+                dos_api_memcpy(hle_ram + dlin, hle_ram + slin, chunk);
+                jit_note_write(dlin, (uint32_t)chunk);
+            } else              /* (the VGA window: through its planes, as g_write) */
+                for (size_t i = 0; i < chunk; i++)
+                    g_wr8(dlin + (uint32_t)i, g_rd8(slin + (uint32_t)i));
         }
         n -= chunk;
         doff = (uint16_t)(doff + chunk);
