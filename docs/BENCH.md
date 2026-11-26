@@ -148,3 +148,9 @@ What still falls back (`CUR_FLAGS="-DFX16_ENABLE=1 -DFX16_FBSTATS" run.sh bench1
 
 **Correction (2026-11-25):** the "16-bit protected mode" share of DOS/4GW Doom (37% above, 21% in a later count) is an artifact. FX_STATS assigns a whole 4096-instruction slice to the mode it starts in, and interrupts are taken at slice start: Doom's 140 Hz timer starts about 147 slices a second in DOS/4GW's 16-bit IRQ handler, which goes back to 32-bit code within a few instructions. Running that code in fastloop16.inc changed nothing (18,245 vs 18,260 realtics). The time is in flat 32-bit code, so fastloop.inc's loop in SRAM is what gained.
 
+
+### DnCraptor's x86 → ARM translator (reviewed 2026-11-26)
+
+His murm386 `jit` branch has a region translator, `src/fdos/xlat/`; the design notes are in docs/external/murm386-FDOS-JIT-architecture.md. It compiles hot real-mode loops to Thumb-2 and runs them at 15–60 MIPS, against 2.4–9 for his interpreter. Whole programs don't gain yet: CheckIt v1 gives 3793 Dhrystones with it and 4138 without. It is built on XRIP (pico-286's core), not on our i386.c, so it isn't ported.
+
+His observation that device servicing after every slice costs time was checked here: 8192-instruction slices instead of 4096 gave Doom 286 10.201 fps against 10.140, which is noise. The slice stays at 4096.
