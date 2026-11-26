@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "flash_config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -879,21 +880,13 @@ static int __no_inline_not_in_flash_func(flash_ensure_qe)(uint8_t *jedec_mfr) {
     const uint8_t sr2 = rx[1];
     if (sr2 & 0x02) return 0;
 
-    tx[0] = 0x06;                       // Write Enable
-    flash_do_cmd(tx, rx, 1);
-    tx[0] = 0x31; tx[1] = sr2 | 0x02;   // Write SR2, keep the other bits
-    flash_do_cmd(tx, rx, 2);
-
-    // Poll WIP. tW is 15 ms worst case; each poll is tens of us.
-    for (int i = 0; i < 100000; i++) {
-        tx[0] = 0x05; tx[1] = 0;
-        flash_do_cmd(tx, rx, 2);
-        if (!(rx[1] & 0x01)) break;
-    }
-
-    tx[0] = 0x35; tx[1] = 0;
-    flash_do_cmd(tx, rx, 2);
-    return (rx[1] & 0x02) ? 1 : -2;
+    /* The write: xrip/pico-386's flash_config_init() (drivers/flash-config).
+     * WREN, the SR2 write and the busy poll in one QMI direct-mode session:
+     * flash_do_cmd() per command put XIP back (boot2's replay) while the
+     * chip was still writing its status register. It checks SR1's protection
+     * bits, enters BOOTSEL on a 100 ms busy timeout, and leaves the ROM's
+     * quad read mode at divider 12 (set_flash_timings follows). */
+    return flash_config_init() ? 1 : -2;
 }
 
 static void flash_qe_fixup(void) {
@@ -910,6 +903,10 @@ static void flash_qe_fixup(void) {
         DBG_PRINT("Flash JEDEC %02X: QE %s\n", mfr, r == 0 ? "set" : "not checked");
 }
 
+/* the flash timing boot2 left, and the clock it was for (main(), before any
+ * change): RXDELAY scales from it */
+static uint32_t boot_flash_timing, boot_flash_hz;
+
 // Flash timing configuration for overclocking
 void __no_inline_not_in_flash_func(set_flash_timings)(int cpu_mhz, int cfg_flash) {
     const int clock_hz = cpu_mhz * 1000000;
@@ -920,9 +917,23 @@ void __no_inline_not_in_flash_func(set_flash_timings)(int cpu_mhz, int cfg_flash
         divisor = 2;
     }
 
+    /* RXDELAY (half clk_sys cycles) is 3 bits. Up to divider 7, the divider
+     * itself (+1 over 100 MHz), as it always was. Past that, that value went
+     * into the reserved bit 11 and left RXDELAY 0: 8 at 504 MHz / 66 MHz.
+     * There, boot2's delay at the new clock (xrip/pico-386's
+     * flash_timing_for_clock() scaling), at most 7. The scaling is not used
+     * below: at 378 MHz / 84 MHz (divider 5) it gives 6, over half an SCK
+     * period, and the board hung; at 504 / 66 its 7 is checked. */
     int rxdelay = divisor;
     if (clock_hz / divisor > 100000000 && clock_hz >= 166000000) {
         rxdelay += 1;
+    }
+    if (rxdelay > 7) {
+        const uint32_t boot_rx = (boot_flash_timing & QMI_M0_TIMING_RXDELAY_BITS) >> QMI_M0_TIMING_RXDELAY_LSB;
+        const uint32_t boot_mhz = boot_flash_hz / 1000000u;     /* (32 bits: UDIV, no call into flash) */
+        rxdelay = boot_mhz ? (int)((boot_rx * (uint32_t)cpu_mhz + boot_mhz - 1) / boot_mhz) : 7;
+        if (rxdelay > 7)
+            rxdelay = 7;
     }
 
     qmi_hw->m[0].timing = 0x60007000 |
@@ -1211,6 +1222,9 @@ static bool init_hardware(void) {
             current_vreg_mv != vreg_to_mv(get_voltage_for_freq(cfg_cpu))) {
             reconfigure_clocks(cfg_cpu, cfg_psram, psram_pin, cfg_flash);
         }
+        printf("Flash timing: boot %08lx at %lu MHz, now %08lx at %lu MHz\n",
+               (unsigned long)boot_flash_timing, (unsigned long)(boot_flash_hz / 1000000u),
+               (unsigned long)qmi_hw->m[0].timing, (unsigned long)(clock_get_hz(clk_sys) / 1000000u));
 #endif
     }
 
@@ -1691,6 +1705,11 @@ static void console_cmd(char *line) {
         hle_beep(pc, 880, 1000);
         printf("beep done\n");
     }
+    else if (!strcmp(line, "clocks")) {        /* clk_sys and the flash's QMI timing, boot2's and now */
+        printf("clocks: sys %lu MHz, flash timing boot %08lx at %lu MHz, now %08lx\n",
+               (unsigned long)(clock_get_hz(clk_sys) / 1000000u), (unsigned long)boot_flash_timing,
+               (unsigned long)(boot_flash_hz / 1000000u), (unsigned long)qmi_hw->m[0].timing);
+    }
     else if (!strcmp(line, "mem")) {           /* the SRAM heap's room (platform_rp2350.c) */
         extern void heap_report(void);
         heap_report();
@@ -1920,6 +1939,9 @@ int main(void) {
     extern char __scratch_y_end__[];
     uintptr_t stack_limit = ((uintptr_t)__scratch_y_end__ + 7u) & ~7u;
     __asm volatile ("msr msplim, %0" : : "r" (stack_limit));
+
+    boot_flash_timing = qmi_hw->m[0].timing;    /* (set_flash_timings) */
+    boot_flash_hz = clock_get_hz(clk_sys);
 
     // Initialize stdio (USB Serial or UART depending on USB HID mode)
     stdio_init_all();

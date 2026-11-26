@@ -27,10 +27,11 @@ struct struct_fdd {
     uint16_t heads;
     uint8_t readonly;
     uint8_t drive_type;  /* BIOS/CMOS type: 1=360K 2=1.2M 3=720K 4=1.44M 5=2.88M */
-} fdd[2] = {
-    [0] = { .drive_type = 4 },  // A: floppy, default 1.44M
-    [1] = { .drive_type = 4 },  // B: floppy, default 1.44M
-};  // 0-1: floppy, 2-3: HDD, 4: CD-ROM
+} fdd[2] __attribute__((section(".psram_bss")));  // 0-1: floppy, 2-3: HDD, 4: CD-ROM
+/* frank-dos: these tables in PSRAM, not SRAM (3.6 KB the heap needs): the
+ * disks are INT 13h's (hle/int13.c) and these are only the old disk menu's.
+ * Zero at first (dosrt_psram_init): a floppy's drive_type 0 reads as 4, the
+ * 1.44 MB default the initialiser gave */
 
 struct struct_ata {
     FIL fil;
@@ -41,7 +42,7 @@ struct struct_ata {
     uint16_t heads;
     uint8_t iscdrom;
     uint8_t drive_type;
-} ata[4] = { 0 };
+} ata[4] __attribute__((section(".psram_bss")));
 
 
 static CPUI386 *disk_cpu = NULL;
@@ -117,8 +118,8 @@ static void install_fdpt(void) {
 
 static void update_floppy_cmos(void) {
     if (!disk_cmos_update_cb) return;
-    uint8_t ta = fdd[0].drive_type;
-    uint8_t tb = fdd[1].drive_type;
+    uint8_t ta = fdd[0].drive_type ? fdd[0].drive_type : 4;
+    uint8_t tb = fdd[1].drive_type ? fdd[1].drive_type : 4;
     disk_cmos_update_cb(ta, tb);
 }
 

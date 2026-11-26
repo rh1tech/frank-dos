@@ -687,6 +687,9 @@ target_link_libraries(fdos PRIVATE pico_stdlib_headers hardware_pio_headers hard
     pico_time_headers hardware_sync_headers)
 target_include_directories(fdos PRIVATE ${CMAKE_CURRENT_LIST_DIR}/drivers/fatfs ${CMAKE_CURRENT_LIST_DIR}/drivers/sdcard)
 
+# xrip/pico-386's flash Quad Enable setup (drivers/flash-config/README.md)
+include(${CMAKE_CURRENT_LIST_DIR}/drivers/flash-config/CMakeLists.txt)
+target_link_libraries(${BUILD_NAME} flash-config)
 target_link_libraries(${BUILD_NAME}
     fdos
     pico_stdlib
