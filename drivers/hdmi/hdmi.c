@@ -1060,11 +1060,25 @@ static void __time_critical_func(balance_pair)(uint8_t va, uint8_t vb, uint16_t 
     *b = sb;
 }
 
+#if HDMI_HSTX_BACKEND
+static bool hstx_mode;    /* the Olimex RP2350pc: the picture goes by HSTX */
+static uint32_t hstx_pal[256]; /* an index's two output pixels, BGR555, the first in the low half */
+static inline uint32_t bgr555(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint32_t)(r >> 3) | (uint32_t)(g >> 3) << 5 | (uint32_t)(b >> 3) << 10;
+}
+#endif
+
 void __time_critical_func(graphics_set_palette_hdmi2)(
     const uint8_t R1, const uint8_t G1, const uint8_t B1,
     const uint8_t R2, const uint8_t G2, const uint8_t B2,
     uint8_t i
 ) {
+#if HDMI_HSTX_BACKEND
+    if (hstx_mode) {
+        hstx_pal[i] = bgr555(R1, G1, B1) | bgr555(R2, G2, B2) << 16;
+        return;
+    }
+#endif
     uint16_t r1, r2, g1, g2, b1, b2;
     balance_pair(R1, R2, &r1, &r2);
     balance_pair(G1, G2, &g1, &g2);
@@ -1148,12 +1162,101 @@ static void make_tables(void) {
     audio_step = (735u << 16) / TOTAL_LINES;
 }
 
+#if HDMI_HSTX_BACKEND
+/* ================= The Olimex RP2350pc: HSTX =================
+ * Its HDMI pairs run D0, CLK, D2, D1 from GPIO12, P first: the PIO output
+ * takes the data as six pins in a row with the clock beside them, and the
+ * clock sits between the data pairs here. HSTX maps any signal to any pin.
+ * The renderers and the palette (an index a pair of pixels) are the PIO
+ * path's; frank-sdk's psx_video sends the lines, the audio in data islands
+ * from the same ring hdmi_audio_push() fills. */
+#include "psx_video.h"
+#include "hstx_data_island_queue.h"
+
+/* HDMI_PAIRS(D0+, CK+, D2+, D1+): a nibble a pair from GPIO12, the signal
+ * (0 clock, 1-3 data lanes 0-2) and bit 2 for P on the even pin */
+#define RP2350PC_HDMI_PAIRS 0x6745u
+
+static uint32_t (*hstx_lines)[ROW_PIXELS]; /* 4 lines of 640 pixels, in the HDMI block */
+
+static void __time_critical_func(hstx_on_line)(uint32_t out_line, psxv_line_t *l) {
+    if (out_line == 0 && vga_state) {
+        vga_state->st01 &= ~ST01_V_RETRACE;
+        vga_state->st01 |= ST01_DISP_ENABLE;
+    }
+    l->mode = PSXV_LINE_NATIVE;
+    if ((int)out_line < active_start || (int)out_line >= active_end)
+        return; /* psx_video's black line */
+    uint32_t *dst = hstx_lines[out_line & 3];
+    render_line(out_line - active_start, row8);
+    for (int x = 0; x < ROW_PIXELS; x++) dst[x] = hstx_pal[row8[x]];
+    l->pixels = (const uint16_t *)dst;
+}
+
+static void __time_critical_func(hstx_on_vsync)(void) {
+    frame_update_request = 1;
+    hdmi_frame_count++;
+    if (vga_state) {
+        vga_state->st01 |= ST01_V_RETRACE;
+        vga_state->st01 &= ~ST01_DISP_ENABLE;
+        /* the start address, panning and line compare for the next frame,
+         * as the PIO path takes them late in its blank (a VGA latches them
+         * as its retrace begins) */
+        const uint8_t *cr = vga_state->cr;
+        frame_vram_offset = (uint16_t)((cr[0x0c] << 8) | cr[0x0d]);
+        frame_pixel_panning = vga_state->ar[0x13] & 0x07;
+        int lc = (int)cr[0x18] | (((int)cr[0x07] & 0x10) << 4) | (((int)cr[0x09] & 0x40) << 3);
+        frame_line_compare = (lc > 0 && lc < 480) ? lc : -1;
+    }
+}
+
+/* 4 frames for the next audio packet; the last one again if the ring ran dry */
+static void __time_critical_func(hstx_audio_src)(uint32_t frames[4]) {
+    for (int i = 0; i < 4; i++) {
+        uint32_t rd = audio_rd;
+        if (rd != audio_wr) {
+            audio_last = audio_ring[rd & (AUDIO_RING - 1)];
+            audio_rd = rd + 1;
+        } else {
+            hdmi_audio_underruns++;
+        }
+        frames[i] = audio_last;
+    }
+}
+
+static void hstx_start(uint8_t *block) {
+    hstx_lines = (uint32_t (*)[ROW_PIXELS])block;
+    row8 = (uint8_t *)(hstx_lines + 4);
+    audio_ring = (uint32_t *)(row8 + SCREEN_WIDTH);
+    static_assert(4 * ROW_PIXELS * 4 + SCREEN_WIDTH + AUDIO_RING * 4 <= HDMI_RAM_BLOCK,
+                  "the HSTX lines, the row and the audio ring fit the HDMI block");
+    hstx_mode = true;
+    hdmi_text_palette();
+    psxv_init();
+    psxv_set_mode(640, 480);
+    psxv_set_hdmi_pairs(RP2350PC_HDMI_PAIRS);
+    psxv_set_line_callback(hstx_on_line);
+    psxv_set_vsync_callback(hstx_on_vsync);
+    psxv_set_audio_sample_rate(44100);
+    hstx_di_queue_set_audio_source(hstx_audio_src);
+    audio_on = true;
+    psxv_start();
+    printf("HDMI: HSTX output (Olimex RP2350pc pair order)\n");
+}
+#endif
+
 void graphics_init_hdmi(void) {
     extern void *video_ram_block; /* main.c: the heap's top 8 KB */
     uint8_t *block = video_ram_block;
     if (!block) block = memalign(HDMI_RAM_BLOCK, HDMI_RAM_BLOCK);
     hard_assert(block);
     memset(block, 0, HDMI_RAM_BLOCK);
+#if HDMI_HSTX_BACKEND
+    if (board_is_rp2350pc()) {
+        hstx_start(block);
+        return;
+    }
+#endif
     conv_color = (uint32_t *)block;
     rows = (uint16_t (*)[ROW_PIXELS])(block + CONV_COLOR_WORDS * sizeof(uint32_t));
     row8 = (uint8_t *)(rows + 3);
@@ -1334,6 +1437,9 @@ void hdmi_watchdog(void) {
  * main.c raises it after BIOS loading. "line" takes its ctrl word from each
  * block, so the words change too. */
 void hdmi_set_dma_high_priority(void) {
+#if HDMI_HSTX_BACKEND
+    if (hstx_mode) return; /* psx_video's channels: the bus priority it sets */
+#endif
     ctrl_quiet |= DMA_CH0_CTRL_TRIG_HIGH_PRIORITY_BITS;
     ctrl_irq |= DMA_CH0_CTRL_TRIG_HIGH_PRIORITY_BITS;
     ctrl_quiet_fixed |= DMA_CH0_CTRL_TRIG_HIGH_PRIORITY_BITS;

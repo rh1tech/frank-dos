@@ -304,6 +304,17 @@ target_compile_definitions(video_driver PRIVATE
 target_link_libraries(video_driver pico_stdlib hardware_dma hardware_pio hardware_clocks hardware_sync)
 # the HDMI line IRQ must stay in SRAM: no loops turned into newlib calls
 set_source_files_properties(drivers/hdmi/hdmi.c PROPERTIES COMPILE_OPTIONS "-fno-tree-loop-distribute-patterns")
+# The Olimex RP2350pc (BOARD=PC on an RP2350B) carries its HDMI pairs in an
+# order the PIO output cannot drive: there hdmi.c hands the picture to HSTX
+# (frank-sdk's psx_video, the pair order taken at run time).
+if(BOARD STREQUAL "PC")
+    target_sources(video_driver PRIVATE
+        drivers/hdmi_hstx/psx_video.c
+        drivers/hdmi_hstx/hstx_data_island_queue.c
+    )
+    target_include_directories(video_driver PUBLIC drivers/hdmi_hstx)
+    target_compile_definitions(video_driver PRIVATE HDMI_HSTX_BACKEND=1)
+endif()
 
 #=============================================================================
 # Runtime I2S/PWM Audio Driver
