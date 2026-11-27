@@ -227,6 +227,19 @@ static void dac_ega(void)
 	}
 }
 
+/* the 200-line modes (4-6, 0Dh, 0Eh): CGA colours, bit 4 is the intensity
+   (their attributes 8-15 are 10h-17h); bits 3 and 5 don't count, 6 is brown */
+static void dac_cga(void)
+{
+	outb(0x3C8, 0);
+	for (int i = 0; i < 64; i++) {
+		int hi = 0x15 * ((i >> 4) & 1);
+		outb(0x3C9, 0x2A * ((i >> 2) & 1) + hi);
+		outb(0x3C9, (i & 0x17) == 6 ? 0x15 : 0x2A * ((i >> 1) & 1) + hi);
+		outb(0x3C9, 0x2A * (i & 1) + hi);
+	}
+}
+
 /* the IBM default 256: 16 CGA colours, 16 greys, 9 hue wheels, 8 black */
 static void dac_vga256(void)
 {
@@ -351,6 +364,8 @@ static void set_mode(uint8_t al)
 	program(v);
 	if (v->kind == M_LINEAR)
 		dac_vga256();
+	else if (v->kind == M_CGA4 || v->kind == M_CGA2 || (v->kind == M_PLANAR && v->charh == 8))
+		dac_cga();
 	else
 		dac_ega();
 

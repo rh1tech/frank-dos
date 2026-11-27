@@ -14,6 +14,12 @@
 
 extern FATFS fs;
 
+#ifdef FRANK_HOST
+#define DISK_PSRAM
+#else
+#define DISK_PSRAM __attribute__((section(".psram_bss")))
+#endif
+
 int hdcount = 0;
 
 static uint8_t sectorbuffer[512];
@@ -27,7 +33,7 @@ struct struct_fdd {
     uint16_t heads;
     uint8_t readonly;
     uint8_t drive_type;  /* BIOS/CMOS type: 1=360K 2=1.2M 3=720K 4=1.44M 5=2.88M */
-} fdd[2] __attribute__((section(".psram_bss")));  // 0-1: floppy, 2-3: HDD, 4: CD-ROM
+} fdd[2] DISK_PSRAM;  // 0-1: floppy, 2-3: HDD, 4: CD-ROM
 /* frank-dos: these tables in PSRAM, not SRAM (3.6 KB the heap needs): the
  * disks are INT 13h's (hle/int13.c) and these are only the old disk menu's.
  * Zero at first (dosrt_psram_init): a floppy's drive_type 0 reads as 4, the
@@ -42,7 +48,7 @@ struct struct_ata {
     uint16_t heads;
     uint8_t iscdrom;
     uint8_t drive_type;
-} ata[4] __attribute__((section(".psram_bss")));
+} ata[4] DISK_PSRAM;
 
 
 static CPUI386 *disk_cpu = NULL;
